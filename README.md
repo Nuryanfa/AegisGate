@@ -1,11 +1,41 @@
-# AegisGate
+# 🛡️ AegisGate
+
+### A security-first API gateway engineered in Go
 
 AegisGate is a portfolio-grade, cloud-native API gateway and security platform
-built primarily in Go. Sprint 0 (`v0.1`) establishes a small, testable HTTP
-gateway foundation using the Go standard library.
+built primarily in Go. The project develops each capability as a small, tested
+milestone and documents the engineering trade-offs along the way.
 
-> Project status: Sprint 0 implementation. This is an engineering portfolio
-> project, not a replacement for a production edge proxy or enterprise WAF.
+> **Status:** Sprint 0 (`v0.1`) Gateway Foundation is implemented and validated
+> on `main`. Active milestone development continues on `develop`.
+
+[Product requirements](PRD.md) · [Engineering notes](docs/PROJECT_MEMORY.md) ·
+[Roadmap](#roadmap)
+
+## Why AegisGate?
+
+Applications with several backend services need a consistent entry point for
+routing, request correlation, traffic controls, and security policies.
+AegisGate is a hands-on exploration of that edge layer, beginning with a
+working reverse proxy and expanding through later security and observability
+milestones.
+
+```mermaid
+flowchart LR
+    C["Client"] --> G["AegisGate"]
+    G --> A["Service A"]
+    G --> B["Service B"]
+```
+
+AegisGate is an engineering portfolio project. It is not an enterprise WAF,
+SIEM, or drop-in replacement for an established gateway.
+
+## Engineering focus
+
+- **Go networking:** HTTP lifecycle, routing, and reverse proxying
+- **Security:** explicit trust boundaries, safe errors, and testable assumptions
+- **Reliability:** timeouts, graceful shutdown, and upstream failure handling
+- **Operations:** containers, CI, structured logs, and reproducible validation
 
 ## Sprint 0 capabilities
 
@@ -155,11 +185,27 @@ make build
 
 ## Development workflow
 
-- `main` is the stable branch and should contain only reviewed, validated code.
+- `main` is the stable branch and contains only reviewed, validated code.
 - `develop` is the integration branch for the next milestone and ongoing work.
 - Create short-lived feature branches from `develop`, then merge them back
   through pull requests after CI passes.
 - Promote `develop` to `main` only when the milestone definition of done is met.
+
+## Roadmap
+
+| Milestone | Scope | Status |
+| --- | --- | --- |
+| v0.1 · Gateway Foundation | HTTP server, prefix routing, proxy, request IDs, logging, health, tests, Docker, and CI | Implemented |
+| v0.2 · Configurable Routing | Declarative routes, validation, route settings, and policy metadata | Next |
+| v0.3 · Authentication | Identity and API access controls | Planned |
+| v0.4 · Rate Limiting | Distributed traffic controls | Planned |
+| v0.5 · WAF | Request inspection and rule evaluation | Planned |
+| v0.6 · Detection | Security events and detection workflows | Planned |
+| v0.7 · Observability | Metrics, traces, and operational visibility | Planned |
+| v0.8 · Distributed Deployment | Deployment and resilience across instances | Planned |
+
+Milestone details and proposed requirements live in [PRD.md](PRD.md). Roadmap
+entries are goals, not claims that unimplemented features already work.
 
 ## Current limitations
 
@@ -170,13 +216,19 @@ an observability stack, WebSocket-specific policy, a control plane, or a
 frontend. TLS termination and trusted-proxy topology are also deployment
 concerns not configured in this milestone.
 
+## Principles
+
+1. Ship a working vertical slice before expanding the platform.
+2. Prefer the Go standard library when it meets the requirement.
+3. Test routing, proxy behavior, failures, and concurrency as features arrive.
+4. Separate implemented capabilities from future plans.
+5. Publish performance claims only with a reproducible benchmark and environment details.
+
 ## Next milestone
 
 The next logical milestone is **v0.2 — Configurable Routing and Gateway Policy
 Foundation**. It should introduce validated multi-route configuration and clear
 policy attachment points without implementing the later security platform.
-
-See [PRD.md](PRD.md) for the broader product vision.
 
 ## License
 

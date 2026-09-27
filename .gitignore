@@ -1,0 +1,82 @@
+# Local agent and assistant configuration
+AGENT.md
+AGENTS.md
+agent.md
+.agents/
+.codex/
+.claude/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+secrets/
+credentials/
+
+# Go build and test artifacts
+bin/
+dist/
+build/
+coverage/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+vendor/
+
+# Runtime data and logs
+data/
+tmp/
+*.log
+*.pid
+
+# Frontend dependencies and output
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE and operating system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Terraform local state and overrides
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local configuration overrides and databases
+configs/local.yaml
+configs/local.yml
+*.db
+*.sqlite
+*.sqlite3

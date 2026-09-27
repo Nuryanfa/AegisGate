@@ -5,24 +5,36 @@ services:
       dockerfile: deployments/docker/Dockerfile
       target: gateway
     environment:
-      AEGIS_ENV: production
-      AEGIS_HTTP_ADDR: :8080
-      AEGIS_READ_TIMEOUT: 10s
-      AEGIS_WRITE_TIMEOUT: 15s
-      AEGIS_IDLE_TIMEOUT: 60s
-      AEGIS_SHUTDOWN_TIMEOUT: 10s
-      AEGIS_UPSTREAM_URL: http://example-upstream:8081
+      AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
+    volumes:
+      - ./configs/config.docker.yaml:/etc/aegisgate/config.yaml:ro
     ports:
       - "8080:8080"
     depends_on:
-      - example-upstream
+      - users-upstream
+      - orders-upstream
     init: true
 
-  example-upstream:
+  users-upstream:
     build:
       context: .
       dockerfile: deployments/docker/Dockerfile
       target: example-upstream
+    environment:
+      EXAMPLE_SERVICE_NAME: users-upstream
+      EXAMPLE_HTTP_ADDR: :8081
+    expose:
+      - "8081"
+    init: true
+
+  orders-upstream:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: example-upstream
+    environment:
+      EXAMPLE_SERVICE_NAME: orders-upstream
+      EXAMPLE_HTTP_ADDR: :8081
     expose:
       - "8081"
     init: true

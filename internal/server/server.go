@@ -81,12 +81,22 @@ func (s *Server) Run(ctx context.Context, shutdownTimeout time.Duration) error {
 // ReadinessCheck can be extended with dependency checks in later milestones.
 type ReadinessCheck func(context.Context) error
 
-func HealthHandler(w http.ResponseWriter, _ *http.Request) {
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeStatus(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
 	writeStatus(w, http.StatusOK, "ok")
 }
 
 func ReadinessHandler(checks ...ReadinessCheck) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeStatus(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
 		for _, check := range checks {
 			if err := check(r.Context()); err != nil {
 				writeStatus(w, http.StatusServiceUnavailable, "not_ready")

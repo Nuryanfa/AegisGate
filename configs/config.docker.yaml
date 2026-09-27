@@ -1,5 +1,5 @@
 server:
-  environment: development
+  environment: production
   address: ":8080"
   read_timeout: 10s
   write_timeout: 15s
@@ -9,10 +9,10 @@ server:
 routes:
   - id: users
     path_prefix: /api/users
-    upstream: http://localhost:8081
+    upstream: http://users-upstream:8081
     timeout: 5s
 
   - id: orders
     path_prefix: /api/orders
-    upstream: http://localhost:8082
+    upstream: http://orders-upstream:8081
     timeout: 8s

@@ -23,6 +23,18 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
+func TestHealthHandlerRejectsOtherMethods(t *testing.T) {
+	response := httptest.NewRecorder()
+	HealthHandler(response, httptest.NewRequest(http.MethodPost, "/healthz", nil))
+
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
+	}
+	if got := response.Header().Get("Allow"); got != http.MethodGet {
+		t.Fatalf("Allow = %q, want GET", got)
+	}
+}
+
 func TestReadinessHandlerReportsFailedCheck(t *testing.T) {
 	handler := ReadinessHandler(func(_ context.Context) error {
 		return errors.New("dependency unavailable")

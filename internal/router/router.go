@@ -2,87 +2,100 @@ package router
 
 import (
 	"fmt"
+	"net/url"
+	"path"
 	"sort"
 	"strings"
+	"time"
 )
 
-// Route describes a gateway route and its upstream destination.
+// Route describes one validated gateway route and its upstream policy.
 type Route struct {
-	ID       string
-	Path     string
-	Upstream string
-}
-
-type compiledRoute struct {
-	route  Route
-	prefix string
-	exact  bool
+	ID         string
+	PathPrefix string
+	Upstream   string
+	Timeout    time.Duration
 }
 
 // Router matches request paths against an immutable, deterministic route set.
 type Router struct {
-	routes []compiledRoute
+	routes []Route
 }
 
-// New validates and compiles routes. A path ending in * is a prefix route;
-// every other path is an exact route.
+// New validates routing identity and path semantics, then sorts routes so the
+// longest valid path prefix always wins regardless of file order.
 func New(routes []Route) (*Router, error) {
-	compiled := make([]compiledRoute, 0, len(routes))
+	compiled := make([]Route, 0, len(routes))
 	seenIDs := make(map[string]struct{}, len(routes))
-	seenPaths := make(map[string]struct{}, len(routes))
+	seenPrefixes := make(map[string]struct{}, len(routes))
 
 	for _, route := range routes {
-		if route.ID == "" {
-			return nil, fmt.Errorf("route ID must not be empty")
+		if route.ID == "" || strings.TrimSpace(route.ID) != route.ID {
+			return nil, fmt.Errorf("route ID must be non-empty without surrounding whitespace")
 		}
 		if _, exists := seenIDs[route.ID]; exists {
 			return nil, fmt.Errorf("duplicate route ID %q", route.ID)
 		}
 		seenIDs[route.ID] = struct{}{}
 
+		if err := validatePrefix(route.PathPrefix); err != nil {
+			return nil, fmt.Errorf("route %q: %w", route.ID, err)
+		}
+		if _, exists := seenPrefixes[route.PathPrefix]; exists {
+			return nil, fmt.Errorf("duplicate route path prefix %q", route.PathPrefix)
+		}
+		seenPrefixes[route.PathPrefix] = struct{}{}
+
 		if route.Upstream == "" {
 			return nil, fmt.Errorf("route %q upstream must not be empty", route.ID)
 		}
-		if !strings.HasPrefix(route.Path, "/") {
-			return nil, fmt.Errorf("route %q path must start with /", route.ID)
+		if route.Timeout <= 0 {
+			return nil, fmt.Errorf("route %q timeout must be greater than zero", route.ID)
 		}
-		if strings.Count(route.Path, "*") > 1 || (strings.Contains(route.Path, "*") && !strings.HasSuffix(route.Path, "*")) {
-			return nil, fmt.Errorf("route %q wildcard is only allowed at the end", route.ID)
-		}
-		if _, exists := seenPaths[route.Path]; exists {
-			return nil, fmt.Errorf("duplicate route path %q", route.Path)
-		}
-		seenPaths[route.Path] = struct{}{}
-
-		exact := !strings.HasSuffix(route.Path, "*")
-		prefix := strings.TrimSuffix(route.Path, "*")
-		if prefix == "" {
-			return nil, fmt.Errorf("route %q path must not be empty", route.ID)
-		}
-		compiled = append(compiled, compiledRoute{route: route, prefix: prefix, exact: exact})
+		compiled = append(compiled, route)
 	}
 
-	// Sorting once keeps matching cheap and makes the longest-prefix rule
-	// independent of configuration order.
 	sort.Slice(compiled, func(i, j int) bool {
-		if len(compiled[i].prefix) == len(compiled[j].prefix) {
-			return compiled[i].route.ID < compiled[j].route.ID
+		if len(compiled[i].PathPrefix) == len(compiled[j].PathPrefix) {
+			return compiled[i].ID < compiled[j].ID
 		}
-		return len(compiled[i].prefix) > len(compiled[j].prefix)
+		return len(compiled[i].PathPrefix) > len(compiled[j].PathPrefix)
 	})
 
 	return &Router{routes: compiled}, nil
 }
 
-// Match returns the most specific route for path.
-func (r *Router) Match(path string) (Route, bool) {
+// Match returns the most specific route whose prefix ends at a path-segment
+// boundary. The root prefix is an explicit catch-all route.
+func (r *Router) Match(requestPath string) (Route, bool) {
 	for _, candidate := range r.routes {
-		if candidate.exact && path == candidate.prefix {
-			return candidate.route, true
-		}
-		if !candidate.exact && strings.HasPrefix(path, candidate.prefix) {
-			return candidate.route, true
+		prefix := candidate.PathPrefix
+		if prefix == "/" || requestPath == prefix ||
+			(strings.HasPrefix(requestPath, prefix) && len(requestPath) > len(prefix) && requestPath[len(prefix)] == '/') {
+			return candidate, true
 		}
 	}
 	return Route{}, false
+}
+
+func validatePrefix(prefix string) error {
+	if prefix == "" || strings.TrimSpace(prefix) != prefix {
+		return fmt.Errorf("path prefix must be non-empty without surrounding whitespace")
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		return fmt.Errorf("path prefix %q must start with /", prefix)
+	}
+	if prefix != "/" && strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("path prefix %q must not end with /", prefix)
+	}
+	if strings.ContainsAny(prefix, "*?#%\\") {
+		return fmt.Errorf("path prefix %q contains unsupported characters", prefix)
+	}
+	if _, err := url.ParseRequestURI(prefix); err != nil {
+		return fmt.Errorf("path prefix %q is not a valid URI path", prefix)
+	}
+	if cleaned := path.Clean(prefix); cleaned != prefix {
+		return fmt.Errorf("path prefix %q is not canonical", prefix)
+	}
+	return nil
 }

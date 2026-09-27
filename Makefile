@@ -1,10 +1,16 @@
-.PHONY: run run-upstream build test test-race fmt vet tidy check
+.PHONY: run run-upstream run-users run-orders build test test-race fmt vet tidy check
 
 run:
-	go run ./cmd/gateway
+	AEGIS_CONFIG_PATH=configs/config.example.yaml go run ./cmd/gateway
 
 run-upstream:
 	go run ./cmd/example-upstream
+
+run-users:
+	EXAMPLE_SERVICE_NAME=users-upstream EXAMPLE_HTTP_ADDR=:8081 go run ./cmd/example-upstream
+
+run-orders:
+	EXAMPLE_SERVICE_NAME=orders-upstream EXAMPLE_HTTP_ADDR=:8082 go run ./cmd/example-upstream
 
 build:
 	go build ./...

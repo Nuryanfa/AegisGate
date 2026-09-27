@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -18,6 +21,8 @@ type Handler struct {
 	router  *router.Router
 	proxies map[string]http.Handler
 }
+
+var errRouteTimeout = errors.New("route timeout exceeded")
 
 // New validates routes and builds one reverse proxy per upstream route.
 func New(routes []router.Route, logger *slog.Logger) (*Handler, error) {
@@ -38,6 +43,9 @@ func New(routes []router.Route, logger *slog.Logger) (*Handler, error) {
 		if upstream.User != nil {
 			return nil, fmt.Errorf("route %q upstream must not include credentials", route.ID)
 		}
+		if upstream.RawQuery != "" || upstream.Fragment != "" {
+			return nil, fmt.Errorf("route %q upstream must not include a query or fragment", route.ID)
+		}
 		proxies[route.ID] = reverseProxy(upstream, logger)
 	}
 
@@ -50,7 +58,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "ROUTE_NOT_FOUND", "no route configured for request", middleware.RequestIDFromContext(r.Context()))
 		return
 	}
-	h.proxies[route.ID].ServeHTTP(w, r)
+
+	ctx, cancel := context.WithTimeoutCause(r.Context(), route.Timeout, errRouteTimeout)
+	defer cancel()
+	h.proxies[route.ID].ServeHTTP(w, r.WithContext(ctx))
 }
 
 func reverseProxy(upstream *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
@@ -73,30 +84,54 @@ func reverseProxy(upstream *url.URL, logger *slog.Logger) *httputil.ReverseProxy
 			request.Out.Header.Set(middleware.RequestIDHeader, middleware.RequestIDFromContext(request.In.Context()))
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			requestID := middleware.RequestIDFromContext(r.Context())
+			if errors.Is(context.Cause(r.Context()), errRouteTimeout) {
+				writeTimeout(logger, upstream, w, r, requestID)
+				return
+			}
+			if r.Context().Err() != nil {
+				logger.InfoContext(r.Context(), "upstream request cancelled by client",
+					"request_id", requestID,
+					"upstream", upstream.Redacted(),
+				)
+				return
+			}
+			var networkError net.Error
+			if errors.As(err, &networkError) && networkError.Timeout() {
+				writeTimeout(logger, upstream, w, r, requestID)
+				return
+			}
 			logger.ErrorContext(r.Context(), "upstream request failed",
-				"request_id", middleware.RequestIDFromContext(r.Context()),
+				"request_id", requestID,
 				"upstream", upstream.Redacted(),
 				"error", err,
 			)
-			writeError(w, http.StatusBadGateway, "BAD_GATEWAY", "upstream service unavailable", middleware.RequestIDFromContext(r.Context()))
+			writeError(w, http.StatusBadGateway, "BAD_GATEWAY", "upstream service unavailable", requestID)
 		},
 	}
 }
 
+func writeTimeout(logger *slog.Logger, upstream *url.URL, w http.ResponseWriter, r *http.Request, requestID string) {
+	logger.WarnContext(r.Context(), "upstream request timed out",
+		"request_id", requestID,
+		"upstream", upstream.Redacted(),
+	)
+	writeError(w, http.StatusGatewayTimeout, "UPSTREAM_TIMEOUT", "upstream service timed out", requestID)
+}
+
 func writeError(w http.ResponseWriter, status int, code, message, requestID string) {
+	type errorDetail struct {
+		Code      string `json:"code"`
+		Message   string `json:"message"`
+		RequestID string `json:"request_id"`
+	}
+	type errorResponse struct {
+		Error errorDetail `json:"error"`
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(struct {
-		Error struct {
-			Code      string `json:"code"`
-			Message   string `json:"message"`
-			RequestID string `json:"request_id"`
-		} `json:"error"`
-	}{
-		Error: struct {
-			Code      string `json:"code"`
-			Message   string `json:"message"`
-			RequestID string `json:"request_id"`
-		}{Code: code, Message: message, RequestID: requestID},
-	})
+	_ = json.NewEncoder(w).Encode(errorResponse{Error: errorDetail{
+		Code: code, Message: message, RequestID: requestID,
+	}})
 }

@@ -45,10 +45,28 @@ JWT, Redis rate limiting, WAF, control plane, persistent database, dashboard,
 Kubernetes, and Terraform remain excluded and must be added only as separate
 verified increments.
 
-Sprint 0 uses Go 1.25, environment-only runtime configuration, standard-library
-HTTP and reverse-proxy components, one example route, a non-root distroless
-container, Docker Compose, and GitHub Actions CI. The next planned milestone is
-v0.2 — Configurable Routing and Gateway Policy Foundation.
+Sprint 0 established Go 1.25, standard-library HTTP and reverse-proxy
+components, a non-root distroless container, Docker Compose, and GitHub Actions
+CI. Its single environment-configured route was replaced by v0.2. The next
+planned milestone is v0.3 — Authentication and Authorization Foundation.
+
+## Confirmed v0.2 routing foundation
+
+- `AEGIS_CONFIG_PATH` selects a required strict YAML file at startup; hot reload
+  is outside v0.2.
+- Route definitions have a single source of truth: the YAML file. Environment
+  variables override only server settings using defaults < file < environment.
+- `AEGIS_UPSTREAM_URL` is rejected with a migration message rather than being
+  silently ignored.
+- Route prefixes are canonical, boundary-aware, unique, and evaluated longest
+  first. `/` is an explicit catch-all; health and readiness stay reserved.
+- Incoming paths are preserved. An upstream base path is prepended using the
+  standard reverse-proxy join behavior.
+- Every route has a positive timeout. A route-owned deadline returns JSON 504;
+  client cancellation does not cause the gateway to manufacture a new error.
+- No inert policy or `auth_required` field exists. Policy schema is deferred
+  until a milestone implements real enforcement.
+- YAML parsing uses the single focused dependency `go.yaml.in/yaml/v3`.
 
 ## Critical engineering observations
 
@@ -129,3 +147,5 @@ These must be confirmed before repository scaffolding hardens them:
   and frontend features outside this milestone.
 - 2026-09-27: Adopted a stable `main` plus integration `develop` branching
   strategy for subsequent milestones.
+- 2026-09-27: Implemented the v0.2 configurable routing foundation on
+  `develop`, including strict YAML, multi-route matching, and route deadlines.

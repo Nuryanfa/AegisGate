@@ -11,7 +11,6 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/config"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/proxy"
-	"github.com/Nuryanfa/AegisGate/internal/router"
 	"github.com/Nuryanfa/AegisGate/internal/server"
 )
 
@@ -24,21 +23,15 @@ func main() {
 	}
 
 	logger := newLogger(cfg.Environment)
-	routes := []router.Route{{
-		ID:       "example-upstream",
-		Path:     "/api/test/*",
-		Upstream: cfg.UpstreamURL.String(),
-	}}
-
-	proxyHandler, err := proxy.New(routes, logger)
+	proxyHandler, err := proxy.New(cfg.Routes, logger)
 	if err != nil {
 		logger.Error("build gateway routes", "error", err)
 		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", server.HealthHandler)
-	mux.Handle("GET /readyz", server.ReadinessHandler())
+	mux.HandleFunc("/healthz", server.HealthHandler)
+	mux.Handle("/readyz", server.ReadinessHandler())
 	mux.Handle("/", proxyHandler)
 
 	handler := middleware.RequestID(middleware.Logging(logger, mux))
@@ -54,7 +47,7 @@ func main() {
 
 	logger.Info("AegisGate initialized",
 		"environment", cfg.Environment,
-		"upstream", cfg.UpstreamURL.Redacted(),
+		"route_count", len(cfg.Routes),
 	)
 	if err := httpServer.Run(ctx, cfg.ShutdownTimeout); err != nil {
 		logger.Error("gateway stopped with an error", "error", err)

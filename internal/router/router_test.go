@@ -1,12 +1,15 @@
 package router
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
-func TestRouterMatch(t *testing.T) {
+func TestRouterMatchUsesBoundariesAndLongestPrefix(t *testing.T) {
 	routes, err := New([]Route{
-		{ID: "api", Path: "/api/*", Upstream: "http://api.example"},
-		{ID: "users", Path: "/api/users/*", Upstream: "http://users.example"},
-		{ID: "health", Path: "/upstream-health", Upstream: "http://api.example"},
+		{ID: "catch-all", PathPrefix: "/", Upstream: "http://root.example", Timeout: time.Second},
+		{ID: "api", PathPrefix: "/api", Upstream: "http://api.example", Timeout: time.Second},
+		{ID: "users", PathPrefix: "/api/users", Upstream: "http://users.example", Timeout: time.Second},
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -16,34 +19,80 @@ func TestRouterMatch(t *testing.T) {
 		name   string
 		path   string
 		wantID string
-		ok     bool
 	}{
-		{name: "prefix route", path: "/api/orders/42", wantID: "api", ok: true},
-		{name: "longest prefix wins", path: "/api/users/42", wantID: "users", ok: true},
-		{name: "exact route", path: "/upstream-health", wantID: "health", ok: true},
-		{name: "exact route rejects suffix", path: "/upstream-health/details", ok: false},
-		{name: "unknown route", path: "/missing", ok: false},
+		{name: "prefix itself", path: "/api/users", wantID: "users"},
+		{name: "prefix child", path: "/api/users/42", wantID: "users"},
+		{name: "most specific wins", path: "/api/users/42/orders", wantID: "users"},
+		{name: "similar segment does not match", path: "/api/users-v2", wantID: "api"},
+		{name: "root is catch all", path: "/unmatched", wantID: "catch-all"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, ok := routes.Match(tt.path)
-			if ok != tt.ok {
-				t.Fatalf("Match(%q) ok = %v, want %v", tt.path, ok, tt.ok)
+			if !ok {
+				t.Fatalf("Match(%q) did not match", tt.path)
 			}
-			if ok && got.ID != tt.wantID {
+			if got.ID != tt.wantID {
 				t.Fatalf("Match(%q).ID = %q, want %q", tt.path, got.ID, tt.wantID)
 			}
 		})
 	}
 }
 
-func TestRouterRejectsAmbiguousRoutes(t *testing.T) {
-	_, err := New([]Route{
-		{ID: "first", Path: "/api/*", Upstream: "http://first.example"},
-		{ID: "second", Path: "/api/*", Upstream: "http://second.example"},
-	})
-	if err == nil {
-		t.Fatal("New() error = nil, want duplicate path error")
+func TestRouterUnknownPathReturnsNoMatch(t *testing.T) {
+	routes, err := New([]Route{{
+		ID: "users", PathPrefix: "/api/users", Upstream: "http://users.example", Timeout: time.Second,
+	}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	for _, requestPath := range []string{"/missing", "/api/users-v2", "/api/user"} {
+		if _, ok := routes.Match(requestPath); ok {
+			t.Errorf("Match(%q) matched unexpectedly", requestPath)
+		}
+	}
+}
+
+func TestRouterRejectsInvalidOrAmbiguousRoutes(t *testing.T) {
+	tests := []struct {
+		name   string
+		routes []Route
+	}{
+		{
+			name: "duplicate ID",
+			routes: []Route{
+				{ID: "api", PathPrefix: "/api", Upstream: "http://one.example", Timeout: time.Second},
+				{ID: "api", PathPrefix: "/other", Upstream: "http://two.example", Timeout: time.Second},
+			},
+		},
+		{
+			name: "duplicate prefix",
+			routes: []Route{
+				{ID: "one", PathPrefix: "/api", Upstream: "http://one.example", Timeout: time.Second},
+				{ID: "two", PathPrefix: "/api", Upstream: "http://two.example", Timeout: time.Second},
+			},
+		},
+		{
+			name:   "trailing slash",
+			routes: []Route{{ID: "api", PathPrefix: "/api/", Upstream: "http://api.example", Timeout: time.Second}},
+		},
+		{
+			name:   "noncanonical prefix",
+			routes: []Route{{ID: "api", PathPrefix: "/api/../admin", Upstream: "http://api.example", Timeout: time.Second}},
+		},
+		{
+			name:   "non-positive timeout",
+			routes: []Route{{ID: "api", PathPrefix: "/api", Upstream: "http://api.example"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := New(tt.routes); err == nil {
+				t.Fatal("New() error = nil, want validation error")
+			}
+		})
 	}
 }

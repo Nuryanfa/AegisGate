@@ -1,6 +1,6 @@
 # AegisGate Project Memory
 
-Last updated: 2026-09-27
+Last updated: 2026-09-28
 
 This file is the durable working memory for the repository. It summarizes the
 current understanding of `PRD.md`; it does not silently turn proposals into
@@ -47,8 +47,9 @@ verified increments.
 
 Sprint 0 established Go 1.25, standard-library HTTP and reverse-proxy
 components, a non-root distroless container, Docker Compose, and GitHub Actions
-CI. Its single environment-configured route was replaced by v0.2. The next
-planned milestone is v0.3 — Authentication and Authorization Foundation.
+CI. Its single environment-configured route was replaced by v0.2, and v0.3
+adds API-client authentication and route authorization. The next planned
+milestone is v0.4 — Rate Limiting.
 
 ## Confirmed v0.2 routing foundation
 
@@ -67,6 +68,27 @@ planned milestone is v0.3 — Authentication and Authorization Foundation.
 - No inert policy or `auth_required` field exists. Policy schema is deferred
   until a milestone implements real enforcement.
 - YAML parsing uses the single focused dependency `go.yaml.in/yaml/v3`.
+
+## Confirmed v0.3 API-client access-control foundation
+
+- Every configured route explicitly selects `public` or `api_key`; omitted or
+  contradictory policy fails startup.
+- Protected routes accept exactly one `X-API-Key` header. Query parameters,
+  duplicate values, malformed values, and oversized values are rejected.
+- Configuration stores only SHA-256 digests and scopes. The static registry is
+  immutable after startup, compares digests in constant time across all keys,
+  and requires all route scopes.
+- This is application/client authentication, not end-user authentication.
+  Upstream services retain responsibility for resource-level user access.
+- Route matching happens once before authorization. More-specific protected
+  routes cannot fall through to public parent prefixes.
+- Credentials and client-supplied `X-Aegis-*` identity headers never reach an
+  upstream. v0.3 emits no gateway identity assertion.
+- Key rotation and revocation require a restart. TLS and secure external secret
+  distribution are mandatory operational controls outside local development.
+- Route timeouts must be strictly below the server write timeout. A timeout
+  cannot be converted to JSON 504 after a response has already started.
+- The trust model and its tradeoffs are recorded in ADR 0001.
 
 ## Critical engineering observations
 
@@ -149,3 +171,6 @@ These must be confirmed before repository scaffolding hardens them:
   strategy for subsequent milestones.
 - 2026-09-27: Implemented the v0.2 configurable routing foundation on
   `develop`, including strict YAML, multi-route matching, and route deadlines.
+- 2026-09-28: Implemented the v0.3 API-client authentication and route-scope
+  authorization foundation on `feature/v0.3-api-client-auth`, using digest-only
+  static keys and explicit public/protected route policies.

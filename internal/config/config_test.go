@@ -18,15 +18,24 @@ server:
   write_timeout: 3s
   idle_timeout: 4s
   shutdown_timeout: 5s
+api_keys:
+  - id: orders-client
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+    scopes: [orders:read]
 routes:
   - id: users
     path_prefix: /api/users
     upstream: http://localhost:8081
     timeout: 750ms
+    auth:
+      mode: public
   - id: orders
     path_prefix: /api/orders
     upstream: http://localhost:8082/base
     timeout: 2s
+    auth:
+      mode: api_key
+      required_scopes: [orders:read]
 `)
 	t.Setenv("AEGIS_CONFIG_PATH", path)
 	t.Setenv("AEGIS_ENV", "production")
@@ -48,6 +57,12 @@ routes:
 	}
 	if len(cfg.Routes) != 2 {
 		t.Fatalf("len(Routes) = %d, want 2", len(cfg.Routes))
+	}
+	if len(cfg.APIKeys) != 1 {
+		t.Fatalf("len(APIKeys) = %d, want 1", len(cfg.APIKeys))
+	}
+	if cfg.Routes[0].Auth.RequiresAPIKey() || !cfg.Routes[1].Auth.RequiresAPIKey() {
+		t.Fatalf("route access policies were not loaded correctly")
 	}
 	if cfg.Routes[0].PathPrefix != "/api/users" || cfg.Routes[0].Timeout != 750*time.Millisecond {
 		t.Fatalf("first route = %#v", cfg.Routes[0])
@@ -85,18 +100,19 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "multiple documents", configuration: validConfig() + "---\nroutes: []\n", wantError: "exactly one YAML document"},
 		{name: "no routes", configuration: "routes: []\n", wantError: "at least one route"},
 		{name: "invalid server timeout", configuration: "server:\n  read_timeout: 0s\n" + validConfig(), wantError: "must be greater than zero"},
+		{name: "route timeout equals write timeout", configuration: "server:\n  write_timeout: 5s\n" + validConfig(), wantError: "must be less than server.write_timeout"},
 		{
 			name: "duplicate IDs",
 			configuration: routesConfig(
-				"  - id: duplicate\n    path_prefix: /one\n    upstream: http://one.example\n    timeout: 1s\n" +
-					"  - id: duplicate\n    path_prefix: /two\n    upstream: http://two.example\n    timeout: 1s\n"),
+				publicRouteYAML("duplicate", "/one", "http://one.example", "1s") +
+					publicRouteYAML("duplicate", "/two", "http://two.example", "1s")),
 			wantError: "duplicate route ID",
 		},
 		{
 			name: "duplicate prefixes",
 			configuration: routesConfig(
-				"  - id: one\n    path_prefix: /same\n    upstream: http://one.example\n    timeout: 1s\n" +
-					"  - id: two\n    path_prefix: /same\n    upstream: http://two.example\n    timeout: 1s\n"),
+				publicRouteYAML("one", "/same", "http://one.example", "1s") +
+					publicRouteYAML("two", "/same", "http://two.example", "1s")),
 			wantError: "duplicate route path prefix",
 		},
 		{name: "empty ID", configuration: singleRoute("", "/api", "http://api.example", "1s"), wantError: ".id must be non-empty"},
@@ -112,6 +128,21 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "missing timeout", configuration: singleRoute("api", "/api", "http://api.example", ""), wantError: ".timeout is required"},
 		{name: "zero timeout", configuration: singleRoute("api", "/api", "http://api.example", "0s"), wantError: "must be greater than zero"},
 		{name: "negative timeout", configuration: singleRoute("api", "/api", "http://api.example", "-1s"), wantError: "must be greater than zero"},
+		{name: "missing access mode", configuration: strings.Replace(validConfig(), "    auth:\n      mode: public\n", "", 1), wantError: "access mode is required"},
+		{name: "unknown access mode", configuration: strings.Replace(validConfig(), "mode: public", "mode: magic", 1), wantError: "unknown access mode"},
+		{name: "public route with scopes", configuration: strings.Replace(validConfig(), "mode: public", "mode: public\n      required_scopes: [orders:read]", 1), wantError: "public access mode cannot require scopes"},
+		{name: "protected route without required scopes", configuration: strings.Replace(validConfig(), "mode: public", "mode: api_key", 1) + validAPIKeys(), wantError: "must require at least one scope"},
+		{name: "duplicate required scopes", configuration: strings.Replace(validConfig(), "mode: public", "mode: api_key\n      required_scopes: [orders:read, orders:read]", 1) + validAPIKeys(), wantError: "duplicate scope"},
+		{name: "invalid required scope", configuration: strings.Replace(validConfig(), "mode: public", "mode: api_key\n      required_scopes: ['bad scope']", 1) + validAPIKeys(), wantError: "scope must match"},
+		{name: "protected route without keys", configuration: strings.Replace(validConfig(), "mode: public", "mode: api_key\n      required_scopes: [orders:read]", 1), wantError: "api_keys is empty"},
+		{name: "unknown auth field", configuration: strings.Replace(validConfig(), "mode: public", "mode: public\n      typo: true", 1), wantError: "field typo not found"},
+		{name: "invalid key ID", configuration: validConfig() + "api_keys:\n  - id: 'bad id'\n    sha256: " + strings.Repeat("0", 64) + "\n", wantError: "API key ID"},
+		{name: "invalid key digest", configuration: validConfig() + "api_keys:\n  - id: client\n    sha256: not-a-digest\n", wantError: "exactly 64 hexadecimal"},
+		{name: "invalid key scope", configuration: validConfig() + "api_keys:\n  - id: client\n    sha256: " + strings.Repeat("0", 64) + "\n    scopes: ['bad scope']\n", wantError: "scope must match"},
+		{name: "empty key scopes", configuration: validConfig() + "api_keys:\n  - id: client\n    sha256: " + strings.Repeat("0", 64) + "\n", wantError: "must declare at least one scope"},
+		{name: "duplicate key scope", configuration: validConfig() + "api_keys:\n  - id: client\n    sha256: " + strings.Repeat("0", 64) + "\n    scopes: [orders:read, orders:read]\n", wantError: "duplicate scope"},
+		{name: "duplicate key IDs", configuration: validConfig() + duplicateKeysYAML("first", "first", strings.Repeat("0", 64), strings.Repeat("1", 64)), wantError: "duplicate API key ID"},
+		{name: "duplicate key digests", configuration: validConfig() + duplicateKeysYAML("first", "second", strings.Repeat("0", 64), strings.Repeat("0", 64)), wantError: "duplicate API key SHA-256 digest"},
 		{
 			name:          "unenforced policy field",
 			configuration: strings.Replace(validConfig(), "    timeout: 5s", "    timeout: 5s\n    auth_required: true", 1),
@@ -155,6 +186,16 @@ func TestLoadRejectsInvalidEnvironmentOverride(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsEnvironmentWriteTimeoutNotAboveRouteTimeout(t *testing.T) {
+	prepareEnvironment(t)
+	t.Setenv("AEGIS_CONFIG_PATH", writeConfig(t, validConfig()))
+	t.Setenv("AEGIS_WRITE_TIMEOUT", "5s")
+
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be less than server.write_timeout") {
+		t.Fatalf("Load() error = %v, want route/write timeout relationship error", err)
+	}
+}
+
 func validConfig() string {
 	return singleRoute("users", "/api/users", "http://localhost:8081", "5s")
 }
@@ -164,10 +205,26 @@ func routesConfig(routes string) string {
 }
 
 func singleRoute(id, prefix, upstream, timeout string) string {
-	return routesConfig("  - id: " + id + "\n" +
+	return routesConfig(publicRouteYAML(id, prefix, upstream, timeout))
+}
+
+func publicRouteYAML(id, prefix, upstream, timeout string) string {
+	return "  - id: " + id + "\n" +
 		"    path_prefix: " + prefix + "\n" +
 		"    upstream: " + upstream + "\n" +
-		"    timeout: " + timeout + "\n")
+		"    timeout: " + timeout + "\n" +
+		"    auth:\n" +
+		"      mode: public\n"
+}
+
+func validAPIKeys() string {
+	return "api_keys:\n  - id: client\n    sha256: " + strings.Repeat("0", 64) + "\n    scopes: [orders:read]\n"
+}
+
+func duplicateKeysYAML(firstID, secondID, firstDigest, secondDigest string) string {
+	return "api_keys:\n" +
+		"  - id: " + firstID + "\n    sha256: " + firstDigest + "\n    scopes: [orders:read]\n" +
+		"  - id: " + secondID + "\n    sha256: " + secondDigest + "\n    scopes: [orders:read]\n"
 }
 
 func writeConfig(t *testing.T, contents string) string {

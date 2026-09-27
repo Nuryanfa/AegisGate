@@ -6,13 +6,30 @@ server:
   idle_timeout: 60s
   shutdown_timeout: 10s
 
+# These digests are deliberately non-working placeholders. Generate real keys
+# with `go run ./cmd/keygen`, keep the plaintext secret outside this repository,
+# and copy only the printed SHA-256 digest into a gitignored local config.
+api_keys:
+  - id: orders-client
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+    scopes: [orders:read]
+
+  - id: limited-client
+    sha256: 1111111111111111111111111111111111111111111111111111111111111111
+    scopes: [profile:read]
+
 routes:
   - id: users
     path_prefix: /api/users
     upstream: http://localhost:8081
     timeout: 5s
+    auth:
+      mode: public
 
   - id: orders
     path_prefix: /api/orders
     upstream: http://localhost:8082
     timeout: 8s
+    auth:
+      mode: api_key
+      required_scopes: [orders:read]

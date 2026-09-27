@@ -25,3 +25,5 @@ node_modules
 *.tfstate*
 secrets
 credentials
+configs/local.yaml
+configs/local.yml

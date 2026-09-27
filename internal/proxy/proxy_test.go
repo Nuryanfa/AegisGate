@@ -2,19 +2,26 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 )
 
-func TestProxyForwardsRequestAndResponse(t *testing.T) {
+const proxyTestCredential = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef"
+
+func TestProxyAllowsPublicRouteWithoutCredentialAndForwardsRequest(t *testing.T) {
 	type observedRequest struct {
 		path           string
 		requestID      string
@@ -42,9 +49,9 @@ func TestProxyForwardsRequestAndResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New([]router.Route{{
-		ID: "test", PathPrefix: "/api/test", Upstream: upstream.URL, Timeout: time.Second,
-	}}, discardLogger())
+	handler, err := New([]router.Route{
+		publicRoute(t, "test", "/api/test", upstream.URL, time.Second),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -95,9 +102,9 @@ func TestProxyForwardsRequestAndResponse(t *testing.T) {
 }
 
 func TestProxyReturnsJSONBadGateway(t *testing.T) {
-	handler, err := New([]router.Route{{
-		ID: "offline", PathPrefix: "/api/test", Upstream: "http://127.0.0.1:0", Timeout: time.Second,
-	}}, discardLogger())
+	handler, err := New([]router.Route{
+		publicRoute(t, "offline", "/api/test", "http://127.0.0.1:0", time.Second),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -136,9 +143,9 @@ func TestProxyRoutesPrefixesToDifferentUpstreams(t *testing.T) {
 	defer orders.Close()
 
 	handler, err := New([]router.Route{
-		{ID: "users", PathPrefix: "/api/users", Upstream: users.URL, Timeout: time.Second},
-		{ID: "orders", PathPrefix: "/api/orders", Upstream: orders.URL, Timeout: time.Second},
-	}, discardLogger())
+		publicRoute(t, "users", "/api/users", users.URL, time.Second),
+		publicRoute(t, "orders", "/api/orders", orders.URL, time.Second),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -170,9 +177,9 @@ func TestProxyPreservesPathWithUpstreamBasePath(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New([]router.Route{{
-		ID: "base", PathPrefix: "/api", Upstream: upstream.URL + "/internal", Timeout: time.Second,
-	}}, discardLogger())
+	handler, err := New([]router.Route{
+		publicRoute(t, "base", "/api", upstream.URL+"/internal", time.Second),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -187,9 +194,9 @@ func TestProxyPreservesPathWithUpstreamBasePath(t *testing.T) {
 }
 
 func TestProxyReturnsJSONNotFound(t *testing.T) {
-	handler, err := New([]router.Route{{
-		ID: "users", PathPrefix: "/api/users", Upstream: "http://users.example", Timeout: time.Second,
-	}}, discardLogger())
+	handler, err := New([]router.Route{
+		publicRoute(t, "users", "/api/users", "http://users.example", time.Second),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -209,9 +216,9 @@ func TestProxyReturnsJSONGatewayTimeout(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New([]router.Route{{
-		ID: "slow", PathPrefix: "/api/slow", Upstream: upstream.URL, Timeout: 50 * time.Millisecond,
-	}}, discardLogger())
+	handler, err := New([]router.Route{
+		publicRoute(t, "slow", "/api/slow", upstream.URL, 50*time.Millisecond),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -227,9 +234,9 @@ func TestProxyDoesNotWriteGatewayErrorAfterClientCancellation(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New([]router.Route{{
-		ID: "cancel", PathPrefix: "/api/cancel", Upstream: upstream.URL, Timeout: time.Second,
-	}}, discardLogger())
+	handler, err := New([]router.Route{
+		publicRoute(t, "cancel", "/api/cancel", upstream.URL, time.Second),
+	}, emptyRegistry(t), discardLogger())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -245,10 +252,233 @@ func TestProxyDoesNotWriteGatewayErrorAfterClientCancellation(t *testing.T) {
 	}
 }
 
+func TestProxyAuthorizesProtectedRouteAndStripsCredentialHeaders(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if got := r.Header.Values(auth.HeaderName); len(got) != 0 {
+			t.Errorf("upstream received API key header: %v", got)
+		}
+		if got := r.Header.Get("X-Aegis-Client-ID"); got != "" {
+			t.Errorf("upstream received spoofed identity header %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	registry := registryForCredential(t, proxyTestCredential, []string{"orders:read"})
+	handler, err := New([]router.Route{{
+		ID:         "orders",
+		PathPrefix: "/api/orders",
+		Upstream:   upstream.URL,
+		Timeout:    time.Second,
+		Auth:       protectedPolicy(t, "orders:read"),
+	}}, registry, discardLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/orders/42", nil)
+	request.Header.Set(auth.HeaderName, proxyTestCredential)
+	request.Header.Set("X-Aegis-Client-ID", "spoofed-client")
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
+	}
+}
+
+func TestProxyRejectsInvalidCredentialsBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	registry := registryForCredential(t, proxyTestCredential, []string{"orders:read"})
+	handler, err := New([]router.Route{{
+		ID:         "orders",
+		PathPrefix: "/api/orders",
+		Upstream:   upstream.URL,
+		Timeout:    time.Second,
+		Auth:       protectedPolicy(t, "orders:read"),
+	}}, registry, discardLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		requestURL string
+		values     []string
+	}{
+		{name: "missing", requestURL: "/api/orders"},
+		{name: "query string is not accepted", requestURL: "/api/orders?api_key=" + proxyTestCredential},
+		{name: "invalid", values: []string{"abcdefghijklmnopqrstuvwxyzABCDEFGH123456789"}},
+		{name: "duplicate", values: []string{proxyTestCredential, proxyTestCredential}},
+		{name: "empty", values: []string{""}},
+		{name: "oversized", values: []string{strings.Repeat("a", auth.MaxCredentialLength+1)}},
+		{name: "malformed", values: []string{strings.Repeat("a", 42) + "+"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requestURL := tt.requestURL
+			if requestURL == "" {
+				requestURL = "/api/orders"
+			}
+			request := httptest.NewRequest(http.MethodGet, requestURL, nil)
+			for _, value := range tt.values {
+				request.Header.Add(auth.HeaderName, value)
+			}
+			response := httptest.NewRecorder()
+			middleware.RequestID(handler).ServeHTTP(response, request)
+			assertJSONError(t, response, http.StatusUnauthorized, "UNAUTHORIZED")
+		})
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("rejected requests reached upstream %d times", upstreamCalls.Load())
+	}
+}
+
+func TestProxyRejectsValidKeyWithInsufficientScope(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	registry := registryForCredential(t, proxyTestCredential, []string{"profile:read"})
+	handler, err := New([]router.Route{{
+		ID:         "orders",
+		PathPrefix: "/api/orders",
+		Upstream:   upstream.URL,
+		Timeout:    time.Second,
+		Auth:       protectedPolicy(t, "orders:read"),
+	}}, registry, discardLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
+	request.Header.Set(auth.HeaderName, proxyTestCredential)
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, request)
+
+	assertJSONError(t, response, http.StatusForbidden, "FORBIDDEN")
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("forbidden request reached upstream %d times", upstreamCalls.Load())
+	}
+}
+
+func TestProtectedChildCannotBypassThroughPublicParentRoute(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler, err := New([]router.Route{
+		publicRoute(t, "public-api", "/api", upstream.URL, time.Second),
+		{
+			ID:         "protected-admin",
+			PathPrefix: "/api/admin",
+			Upstream:   upstream.URL,
+			Timeout:    time.Second,
+			Auth:       protectedPolicy(t, "admin:read"),
+		},
+	}, registryForCredential(t, proxyTestCredential, []string{"admin:read"}), discardLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	protectedResponse := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(
+		protectedResponse,
+		httptest.NewRequest(http.MethodGet, "/api/admin/secrets", nil),
+	)
+	assertJSONError(t, protectedResponse, http.StatusUnauthorized, "UNAUTHORIZED")
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("protected child bypassed authorization and reached upstream")
+	}
+
+	for _, ambiguousPath := range []string{"/api//admin/secrets", "/api/users/../admin/secrets"} {
+		response := httptest.NewRecorder()
+		middleware.RequestID(handler).ServeHTTP(response, httptest.NewRequest(http.MethodGet, ambiguousPath, nil))
+		assertJSONError(t, response, http.StatusNotFound, "ROUTE_NOT_FOUND")
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("ambiguous protected path bypassed authorization and reached upstream")
+	}
+
+	publicResponse := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(
+		publicResponse,
+		httptest.NewRequest(http.MethodGet, "/api/profile", nil),
+	)
+	if publicResponse.Code != http.StatusNoContent {
+		t.Fatalf("public parent status = %d, want %d", publicResponse.Code, http.StatusNoContent)
+	}
+}
+
 func upstreamNameHandler(name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, name+":"+r.URL.Path)
 	})
+}
+
+func publicRoute(t *testing.T, id, pathPrefix, upstream string, timeout time.Duration) router.Route {
+	t.Helper()
+	policy, err := auth.NewPolicy("public", nil)
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	return router.Route{
+		ID:         id,
+		PathPrefix: pathPrefix,
+		Upstream:   upstream,
+		Timeout:    timeout,
+		Auth:       policy,
+	}
+}
+
+func protectedPolicy(t *testing.T, scopes ...string) auth.Policy {
+	t.Helper()
+	policy, err := auth.NewPolicy("api_key", scopes)
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	return policy
+}
+
+func emptyRegistry(t *testing.T) *auth.Registry {
+	t.Helper()
+	registry, err := auth.NewRegistry(nil)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	return registry
+}
+
+func registryForCredential(t *testing.T, plaintext string, scopes []string) *auth.Registry {
+	t.Helper()
+	digest := sha256.Sum256([]byte(plaintext))
+	key, err := auth.NewKey("test-client", fmt.Sprintf("%x", digest), scopes)
+	if err != nil {
+		t.Fatalf("NewKey() error = %v", err)
+	}
+	registry, err := auth.NewRegistry([]auth.Key{key})
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	return registry
 }
 
 func assertJSONError(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode string) {

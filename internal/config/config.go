@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 	"go.yaml.in/yaml/v3"
 )
@@ -32,12 +33,14 @@ type Config struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+	APIKeys         []auth.Key
 	Routes          []router.Route
 }
 
 type fileConfig struct {
-	Server fileServer  `yaml:"server"`
-	Routes []fileRoute `yaml:"routes"`
+	Server  fileServer   `yaml:"server"`
+	APIKeys []fileAPIKey `yaml:"api_keys"`
+	Routes  []fileRoute  `yaml:"routes"`
 }
 
 type fileServer struct {
@@ -50,10 +53,22 @@ type fileServer struct {
 }
 
 type fileRoute struct {
-	ID         string `yaml:"id"`
-	PathPrefix string `yaml:"path_prefix"`
-	Upstream   string `yaml:"upstream"`
-	Timeout    string `yaml:"timeout"`
+	ID         string   `yaml:"id"`
+	PathPrefix string   `yaml:"path_prefix"`
+	Upstream   string   `yaml:"upstream"`
+	Timeout    string   `yaml:"timeout"`
+	Auth       fileAuth `yaml:"auth"`
+}
+
+type fileAuth struct {
+	Mode           string   `yaml:"mode"`
+	RequiredScopes []string `yaml:"required_scopes"`
+}
+
+type fileAPIKey struct {
+	ID     string   `yaml:"id"`
+	SHA256 string   `yaml:"sha256"`
+	Scopes []string `yaml:"scopes"`
 }
 
 // Load reads a strict YAML configuration selected by AEGIS_CONFIG_PATH.
@@ -83,6 +98,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := applyEnvironment(&cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateTimeoutRelationships(cfg); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -155,6 +173,18 @@ func build(raw fileConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	cfg.APIKeys = make([]auth.Key, 0, len(raw.APIKeys))
+	for index, rawKey := range raw.APIKeys {
+		key, err := auth.NewKey(rawKey.ID, rawKey.SHA256, rawKey.Scopes)
+		if err != nil {
+			return Config{}, fmt.Errorf("api_keys[%d]: %w", index, err)
+		}
+		cfg.APIKeys = append(cfg.APIKeys, key)
+	}
+	if _, err := auth.NewRegistry(cfg.APIKeys); err != nil {
+		return Config{}, fmt.Errorf("validate API key registry: %w", err)
+	}
+
 	if len(raw.Routes) == 0 {
 		return Config{}, errors.New("configuration must define at least one route")
 	}
@@ -168,6 +198,11 @@ func build(raw fileConfig) (Config, error) {
 	}
 	if _, err := router.New(cfg.Routes); err != nil {
 		return Config{}, fmt.Errorf("validate routes: %w", err)
+	}
+	for _, route := range cfg.Routes {
+		if route.Auth.RequiresAPIKey() && len(cfg.APIKeys) == 0 {
+			return Config{}, fmt.Errorf("route %q requires API key authentication but api_keys is empty", route.ID)
+		}
 	}
 
 	return cfg, nil
@@ -203,13 +238,27 @@ func parseRoute(index int, raw fileRoute) (router.Route, error) {
 	if err != nil {
 		return router.Route{}, err
 	}
+	policy, err := auth.NewPolicy(raw.Auth.Mode, raw.Auth.RequiredScopes)
+	if err != nil {
+		return router.Route{}, fmt.Errorf("%s.auth: %w", label, err)
+	}
 
 	return router.Route{
 		ID:         raw.ID,
 		PathPrefix: raw.PathPrefix,
 		Upstream:   upstream.String(),
 		Timeout:    timeout,
+		Auth:       policy,
 	}, nil
+}
+
+func validateTimeoutRelationships(cfg Config) error {
+	for _, route := range cfg.Routes {
+		if route.Timeout >= cfg.WriteTimeout {
+			return fmt.Errorf("route %q timeout %s must be less than server.write_timeout %s", route.ID, route.Timeout, cfg.WriteTimeout)
+		}
+	}
+	return nil
 }
 
 func applyEnvironment(cfg *Config) error {

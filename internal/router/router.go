@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Nuryanfa/AegisGate/internal/auth"
 )
 
 // Route describes one validated gateway route and its upstream policy.
@@ -15,6 +17,7 @@ type Route struct {
 	PathPrefix string
 	Upstream   string
 	Timeout    time.Duration
+	Auth       auth.Policy
 }
 
 // Router matches request paths against an immutable, deterministic route set.
@@ -52,6 +55,9 @@ func New(routes []Route) (*Router, error) {
 		if route.Timeout <= 0 {
 			return nil, fmt.Errorf("route %q timeout must be greater than zero", route.ID)
 		}
+		if err := route.Auth.Validate(); err != nil {
+			return nil, fmt.Errorf("route %q authentication policy: %w", route.ID, err)
+		}
 		compiled = append(compiled, route)
 	}
 
@@ -68,6 +74,9 @@ func New(routes []Route) (*Router, error) {
 // Match returns the most specific route whose prefix ends at a path-segment
 // boundary. The root prefix is an explicit catch-all route.
 func (r *Router) Match(requestPath string) (Route, bool) {
+	if !isCanonicalRequestPath(requestPath) {
+		return Route{}, false
+	}
 	for _, candidate := range r.routes {
 		prefix := candidate.PathPrefix
 		if prefix == "/" || requestPath == prefix ||
@@ -76,6 +85,17 @@ func (r *Router) Match(requestPath string) (Route, bool) {
 		}
 	}
 	return Route{}, false
+}
+
+func isCanonicalRequestPath(requestPath string) bool {
+	if requestPath == "" || !strings.HasPrefix(requestPath, "/") || strings.Contains(requestPath, "\\") {
+		return false
+	}
+	canonical := path.Clean(requestPath)
+	if strings.HasSuffix(requestPath, "/") && canonical != "/" {
+		canonical += "/"
+	}
+	return canonical == requestPath
 }
 
 func validatePrefix(prefix string) error {

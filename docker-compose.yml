@@ -7,7 +7,7 @@ services:
     environment:
       AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
     volumes:
-      - ./configs/config.docker.yaml:/etc/aegisgate/config.yaml:ro
+      - ${AEGIS_CONFIG_FILE:-./configs/config.docker.yaml}:/etc/aegisgate/config.yaml:ro
     ports:
       - "8080:8080"
     depends_on:

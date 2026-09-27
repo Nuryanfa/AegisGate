@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/config"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/proxy"
@@ -23,7 +24,12 @@ func main() {
 	}
 
 	logger := newLogger(cfg.Environment)
-	proxyHandler, err := proxy.New(cfg.Routes, logger)
+	registry, err := auth.NewRegistry(cfg.APIKeys)
+	if err != nil {
+		logger.Error("build API key registry", "error", err)
+		os.Exit(1)
+	}
+	proxyHandler, err := proxy.New(cfg.Routes, registry, logger)
 	if err != nil {
 		logger.Error("build gateway routes", "error", err)
 		os.Exit(1)
@@ -48,6 +54,7 @@ func main() {
 	logger.Info("AegisGate initialized",
 		"environment", cfg.Environment,
 		"route_count", len(cfg.Routes),
+		"api_key_count", len(cfg.APIKeys),
 	)
 	if err := httpServer.Run(ctx, cfg.ShutdownTimeout); err != nil {
 		logger.Error("gateway stopped with an error", "error", err)

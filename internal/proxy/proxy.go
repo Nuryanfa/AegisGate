@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 )
@@ -20,12 +21,16 @@ import (
 type Handler struct {
 	router  *router.Router
 	proxies map[string]http.Handler
+	auth    *auth.Registry
 }
 
 var errRouteTimeout = errors.New("route timeout exceeded")
 
 // New validates routes and builds one reverse proxy per upstream route.
-func New(routes []router.Route, logger *slog.Logger) (*Handler, error) {
+func New(routes []router.Route, registry *auth.Registry, logger *slog.Logger) (*Handler, error) {
+	if registry == nil {
+		return nil, errors.New("API key registry must not be nil")
+	}
 	routeTable, err := router.New(routes)
 	if err != nil {
 		return nil, err
@@ -49,13 +54,22 @@ func New(routes []router.Route, logger *slog.Logger) (*Handler, error) {
 		proxies[route.ID] = reverseProxy(upstream, logger)
 	}
 
-	return &Handler{router: routeTable, proxies: proxies}, nil
+	return &Handler{router: routeTable, proxies: proxies, auth: registry}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route, ok := h.router.Match(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusNotFound, "ROUTE_NOT_FOUND", "no route configured for request", middleware.RequestIDFromContext(r.Context()))
+		return
+	}
+	if err := h.auth.Authorize(route.Auth, r.Header); err != nil {
+		requestID := middleware.RequestIDFromContext(r.Context())
+		if errors.Is(err, auth.ErrForbidden) {
+			writeError(w, http.StatusForbidden, "FORBIDDEN", "API key lacks required scope", requestID)
+			return
+		}
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "valid API key required", requestID)
 		return
 	}
 
@@ -74,7 +88,10 @@ func reverseProxy(upstream *url.URL, logger *slog.Logger) *httputil.ReverseProxy
 			// callback. Also remove non-standard variants an upstream might trust,
 			// then rebuild the standard set from the connection AegisGate observed.
 			for name := range request.Out.Header {
-				if strings.HasPrefix(strings.ToLower(name), "x-forwarded-") {
+				lowerName := strings.ToLower(name)
+				if strings.HasPrefix(lowerName, "x-forwarded-") ||
+					lowerName == strings.ToLower(auth.HeaderName) ||
+					strings.HasPrefix(lowerName, "x-aegis-") {
 					request.Out.Header.Del(name)
 				}
 			}

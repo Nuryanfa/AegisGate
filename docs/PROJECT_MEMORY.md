@@ -27,10 +27,10 @@ asynchronous security events, resiliency, and telemetry.
 - Security-event processing should be asynchronous, but enforcement decisions
   that must block a request necessarily remain in the synchronous request path.
 
-## Recommended first vertical slice (pending confirmation)
+## Confirmed Sprint 0 vertical slice
 
-The PRD contains ten roadmap phases. To prevent breadth from hiding engineering
-quality, start with one demonstrable slice:
+The PRD contains ten roadmap phases. Sprint 0 deliberately delivers one
+demonstrable slice:
 
 1. One gateway binary using `net/http` and `httputil.ReverseProxy`.
 2. Static YAML configuration with exact/prefix route matching.
@@ -42,7 +42,13 @@ quality, start with one demonstrable slice:
 7. Docker Compose demo and a reproducible baseline benchmark.
 
 JWT, Redis rate limiting, WAF, control plane, persistent database, dashboard,
-Kubernetes, and Terraform should be added as separate verified increments.
+Kubernetes, and Terraform remain excluded and must be added only as separate
+verified increments.
+
+Sprint 0 uses Go 1.25, environment-only runtime configuration, standard-library
+HTTP and reverse-proxy components, one example route, a non-root distroless
+container, Docker Compose, and GitHub Actions CI. The next planned milestone is
+v0.2 — Configurable Routing and Gateway Policy Foundation.
 
 ## Critical engineering observations
 
@@ -103,8 +109,23 @@ These must be confirmed before repository scaffolding hardens them:
 - Git is installed locally.
 - The directory was not a Git repository when first inspected on 2026-09-27.
 
+## Branching strategy
+
+- `main` is the stable release branch. Only reviewed changes that pass the
+  required quality gates should be merged into it.
+- `develop` is the integration branch for ongoing milestone development.
+- Short-lived feature and fix branches should start from `develop` and return
+  through pull requests.
+- A completed milestone is promoted from `develop` to `main` after tests,
+  documentation, container validation, and review are complete.
+
 ## Decision log
 
 - 2026-09-27: Created durable repository memory and engineering guardrails.
   No architecture proposal in the PRD was treated as final without explicit
   confirmation.
+- 2026-09-27: Confirmed and implemented the Sprint 0/v0.1 gateway-core scope.
+  Kept future security, persistence, messaging, observability, orchestration,
+  and frontend features outside this milestone.
+- 2026-09-27: Adopted a stable `main` plus integration `develop` branching
+  strategy for subsequent milestones.

@@ -1,0 +1,14 @@
+# Reference shape for a future file-based configuration milestone.
+# Sprint 0 reads the equivalent values from environment variables only.
+server:
+  environment: development
+  address: ":8080"
+  read_timeout: 10s
+  write_timeout: 15s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+
+routes:
+  - id: example-upstream
+    path: /api/test/*
+    upstream: http://localhost:8081

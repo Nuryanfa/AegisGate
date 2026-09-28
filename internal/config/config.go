@@ -5,24 +5,32 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Nuryanfa/AegisGate/internal/auth"
+	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 	"go.yaml.in/yaml/v3"
 )
 
 const (
-	maxConfigBytes         = 1 << 20
-	defaultEnvironment     = "development"
-	defaultHTTPAddr        = ":8080"
-	defaultReadTimeout     = 10 * time.Second
-	defaultWriteTimeout    = 15 * time.Second
-	defaultIdleTimeout     = 60 * time.Second
-	defaultShutdownTimeout = 10 * time.Second
+	maxConfigBytes             = 1 << 20
+	defaultEnvironment         = "development"
+	defaultHTTPAddr            = ":8080"
+	defaultReadTimeout         = 10 * time.Second
+	defaultWriteTimeout        = 15 * time.Second
+	defaultIdleTimeout         = 60 * time.Second
+	defaultShutdownTimeout     = 10 * time.Second
+	defaultRedisConnectTimeout = 2 * time.Second
+	defaultRedisCommandTimeout = 500 * time.Millisecond
+	maxRedisTimeout            = 10 * time.Second
+	defaultRedisPoolSize       = 20
+	maxRedisPoolSize           = 1000
 )
 
 // Config contains the validated runtime settings for AegisGate.
@@ -33,12 +41,14 @@ type Config struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+	Redis           *RedisConfig
 	APIKeys         []auth.Key
 	Routes          []router.Route
 }
 
 type fileConfig struct {
 	Server  fileServer   `yaml:"server"`
+	Redis   *fileRedis   `yaml:"redis"`
 	APIKeys []fileAPIKey `yaml:"api_keys"`
 	Routes  []fileRoute  `yaml:"routes"`
 }
@@ -53,11 +63,36 @@ type fileServer struct {
 }
 
 type fileRoute struct {
-	ID         string   `yaml:"id"`
-	PathPrefix string   `yaml:"path_prefix"`
-	Upstream   string   `yaml:"upstream"`
-	Timeout    string   `yaml:"timeout"`
-	Auth       fileAuth `yaml:"auth"`
+	ID         string         `yaml:"id"`
+	PathPrefix string         `yaml:"path_prefix"`
+	Upstream   string         `yaml:"upstream"`
+	Timeout    string         `yaml:"timeout"`
+	Auth       fileAuth       `yaml:"auth"`
+	RateLimit  *fileRateLimit `yaml:"rate_limit"`
+}
+
+type RedisConfig struct {
+	Address        string
+	Username       string
+	Password       string
+	Database       int
+	ConnectTimeout time.Duration
+	CommandTimeout time.Duration
+	PoolSize       int
+}
+
+type fileRedis struct {
+	Address        string `yaml:"address"`
+	Database       int    `yaml:"database"`
+	ConnectTimeout string `yaml:"connect_timeout"`
+	CommandTimeout string `yaml:"command_timeout"`
+	PoolSize       int    `yaml:"pool_size"`
+}
+
+type fileRateLimit struct {
+	Capacity        int64   `yaml:"capacity"`
+	RefillPerSecond float64 `yaml:"refill_per_second"`
+	OnRedisError    string  `yaml:"on_redis_error"`
 }
 
 type fileAuth struct {
@@ -172,6 +207,13 @@ func build(raw fileConfig) (Config, error) {
 	if cfg.ShutdownTimeout, err = optionalDuration("server.shutdown_timeout", raw.Server.ShutdownTimeout, defaultShutdownTimeout); err != nil {
 		return Config{}, err
 	}
+	if raw.Redis != nil {
+		redisConfig, err := parseRedis(*raw.Redis)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Redis = &redisConfig
+	}
 
 	cfg.APIKeys = make([]auth.Key, 0, len(raw.APIKeys))
 	for index, rawKey := range raw.APIKeys {
@@ -203,6 +245,19 @@ func build(raw fileConfig) (Config, error) {
 		if route.Auth.RequiresAPIKey() && len(cfg.APIKeys) == 0 {
 			return Config{}, fmt.Errorf("route %q requires API key authentication but api_keys is empty", route.ID)
 		}
+	}
+	hasRateLimit := false
+	for _, route := range cfg.Routes {
+		if route.RateLimit != nil {
+			hasRateLimit = true
+			break
+		}
+	}
+	if hasRateLimit && cfg.Redis == nil {
+		return Config{}, errors.New("redis configuration is required when any route enables rate limiting")
+	}
+	if !hasRateLimit && cfg.Redis != nil {
+		return Config{}, errors.New("redis configuration is unused because no route enables rate limiting")
 	}
 
 	return cfg, nil
@@ -242,6 +297,14 @@ func parseRoute(index int, raw fileRoute) (router.Route, error) {
 	if err != nil {
 		return router.Route{}, fmt.Errorf("%s.auth: %w", label, err)
 	}
+	var rateLimitPolicy *ratelimit.Policy
+	if raw.RateLimit != nil {
+		parsed, err := ratelimit.NewPolicy(raw.RateLimit.Capacity, raw.RateLimit.RefillPerSecond, raw.RateLimit.OnRedisError)
+		if err != nil {
+			return router.Route{}, fmt.Errorf("%s.rate_limit: %w", label, err)
+		}
+		rateLimitPolicy = &parsed
+	}
 
 	return router.Route{
 		ID:         raw.ID,
@@ -249,6 +312,46 @@ func parseRoute(index int, raw fileRoute) (router.Route, error) {
 		Upstream:   upstream.String(),
 		Timeout:    timeout,
 		Auth:       policy,
+		RateLimit:  rateLimitPolicy,
+	}, nil
+}
+
+func parseRedis(raw fileRedis) (RedisConfig, error) {
+	if strings.TrimSpace(raw.Address) != raw.Address || raw.Address == "" {
+		return RedisConfig{}, errors.New("redis.address must be non-empty without surrounding whitespace")
+	}
+	host, port, err := net.SplitHostPort(raw.Address)
+	if err != nil || host == "" {
+		return RedisConfig{}, errors.New("redis.address must use host:port format")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return RedisConfig{}, errors.New("redis.address must contain a valid TCP port")
+	}
+	if raw.Database < 0 || raw.Database > 1024 {
+		return RedisConfig{}, errors.New("redis.database must be between 0 and 1024")
+	}
+	connectTimeout, err := optionalBoundedDuration("redis.connect_timeout", raw.ConnectTimeout, defaultRedisConnectTimeout, maxRedisTimeout)
+	if err != nil {
+		return RedisConfig{}, err
+	}
+	commandTimeout, err := optionalBoundedDuration("redis.command_timeout", raw.CommandTimeout, defaultRedisCommandTimeout, maxRedisTimeout)
+	if err != nil {
+		return RedisConfig{}, err
+	}
+	poolSize := raw.PoolSize
+	if poolSize == 0 {
+		poolSize = defaultRedisPoolSize
+	}
+	if poolSize < 1 || poolSize > maxRedisPoolSize {
+		return RedisConfig{}, fmt.Errorf("redis.pool_size must be between 1 and %d", maxRedisPoolSize)
+	}
+	return RedisConfig{
+		Address:        raw.Address,
+		Database:       raw.Database,
+		ConnectTimeout: connectTimeout,
+		CommandTimeout: commandTimeout,
+		PoolSize:       poolSize,
 	}, nil
 }
 
@@ -287,6 +390,14 @@ func applyEnvironment(cfg *Config) error {
 	}
 	if cfg.ShutdownTimeout, err = environmentDuration("AEGIS_SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
 		return err
+	}
+	if cfg.Redis != nil {
+		if username, ok := os.LookupEnv("AEGIS_REDIS_USERNAME"); ok {
+			cfg.Redis.Username = username
+		}
+		if password, ok := os.LookupEnv("AEGIS_REDIS_PASSWORD"); ok {
+			cfg.Redis.Password = password
+		}
 	}
 	return nil
 }
@@ -327,6 +438,17 @@ func parsePositiveDuration(name, raw string) (time.Duration, error) {
 	}
 	if value <= 0 {
 		return 0, fmt.Errorf("%s must be greater than zero", name)
+	}
+	return value, nil
+}
+
+func optionalBoundedDuration(name, raw string, fallback, maximum time.Duration) (time.Duration, error) {
+	value, err := optionalDuration(name, raw, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if value > maximum {
+		return 0, fmt.Errorf("%s must not exceed %s", name, maximum)
 	}
 	return value, nil
 }

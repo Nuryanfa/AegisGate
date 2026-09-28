@@ -17,13 +17,17 @@ func TestRegistryAuthorizesPublicAndScopedAPIKeyPolicies(t *testing.T) {
 	public := mustPolicy(t, "public", nil)
 	protected := mustPolicy(t, "api_key", []string{"orders:read", "orders:write"})
 
-	if err := registry.Authorize(public, make(http.Header)); err != nil {
+	if _, err := registry.Authorize(public, make(http.Header)); err != nil {
 		t.Fatalf("public authorization error = %v", err)
 	}
 	headers := make(http.Header)
 	headers.Set(HeaderName, testCredential)
-	if err := registry.Authorize(protected, headers); err != nil {
+	identity, err := registry.Authorize(protected, headers)
+	if err != nil {
 		t.Fatalf("protected authorization error = %v", err)
+	}
+	if clientID, ok := identity.ClientID(); !ok || clientID != "client" {
+		t.Fatalf("authenticated identity = (%q, %v), want client", clientID, ok)
 	}
 }
 
@@ -51,8 +55,12 @@ func TestRegistryRejectsInvalidCredentialTransport(t *testing.T) {
 			for _, value := range tt.values {
 				headers.Add(HeaderName, value)
 			}
-			if err := registry.Authorize(policy, headers); err != ErrUnauthenticated {
+			identity, err := registry.Authorize(policy, headers)
+			if err != ErrUnauthenticated {
 				t.Fatalf("Authorize() error = %v, want ErrUnauthenticated", err)
+			}
+			if clientID, ok := identity.ClientID(); ok || clientID != "" {
+				t.Fatalf("rejected credential produced identity %q", clientID)
 			}
 		})
 	}
@@ -64,7 +72,7 @@ func TestRegistryRejectsInsufficientScopes(t *testing.T) {
 	headers := make(http.Header)
 	headers.Set(HeaderName, testCredential)
 
-	if err := registry.Authorize(policy, headers); err != ErrForbidden {
+	if _, err := registry.Authorize(policy, headers); err != ErrForbidden {
 		t.Fatalf("Authorize() error = %v, want ErrForbidden", err)
 	}
 }
@@ -125,7 +133,8 @@ func TestRegistrySupportsConcurrentAuthorization(t *testing.T) {
 	for range workers {
 		go func() {
 			defer group.Done()
-			errors <- registry.Authorize(policy, headers)
+			_, err := registry.Authorize(policy, headers)
+			errors <- err
 		}()
 	}
 	group.Wait()

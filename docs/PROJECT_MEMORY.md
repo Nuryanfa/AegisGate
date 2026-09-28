@@ -47,9 +47,9 @@ verified increments.
 
 Sprint 0 established Go 1.25, standard-library HTTP and reverse-proxy
 components, a non-root distroless container, Docker Compose, and GitHub Actions
-CI. Its single environment-configured route was replaced by v0.2, and v0.3
-adds API-client authentication and route authorization. The next planned
-milestone is v0.4 — Rate Limiting.
+CI. Its single environment-configured route was replaced by v0.2, v0.3 added
+API-client access control, and v0.4 adds Redis-backed distributed rate
+limiting. The next planned milestone is v0.5 — WAF Foundation.
 
 ## Confirmed v0.2 routing foundation
 
@@ -89,6 +89,28 @@ milestone is v0.4 — Rate Limiting.
 - Route timeouts must be strictly below the server write timeout. A timeout
   cannot be converted to JSON 504 after a response has already started.
 - The trust model and its tradeoffs are recorded in ADR 0001.
+
+## Confirmed v0.4 distributed rate-limiting foundation
+
+- `rate_limit` is optional per route; omission plainly means unlimited by
+  AegisGate. Enabled policies require explicit capacity, refill rate, and Redis
+  failure behavior.
+- One Redis Lua operation atomically reads, refills, decides, consumes, stores,
+  and expires a bucket. Redis `TIME` is the shared clock and negative elapsed
+  time is clamped to zero.
+- Quotas are independent per route. Authenticated routes use validated API
+  client IDs; public routes use direct peer IPs without trusting forwarding
+  headers. Bounded hashes, not raw subjects or credentials, form Redis keys.
+- `deny` returns 503 on Redis failure and makes Redis a readiness dependency.
+  Explicit `allow` temporarily suspends enforcement and keeps readiness green
+  when no fail-closed route exists.
+- Exhaustion returns JSON 429 and an integer `Retry-After`. Rejections happen
+  before upstream contact.
+- Public peer-IP quotas have NAT and reverse-proxy limitations. Invalid-key
+  abuse limiting remains a focused follow-up and no DDoS-prevention claim is
+  made.
+- The algorithm and trust boundary are recorded in ADR 0002. Real Redis script
+  tests run in CI, including cross-client concurrency with no over-admission.
 
 ## Critical engineering observations
 
@@ -174,3 +196,6 @@ These must be confirmed before repository scaffolding hardens them:
 - 2026-09-28: Implemented the v0.3 API-client authentication and route-scope
   authorization foundation on `feature/v0.3-api-client-auth`, using digest-only
   static keys and explicit public/protected route policies.
+- 2026-09-28: Implemented the v0.4 Redis-backed distributed token bucket on
+  `feature/v0.4-distributed-rate-limiting`, with atomic Lua enforcement,
+  subject hashing, explicit outage policy, and fail-closed readiness.

@@ -39,6 +39,7 @@ vendor/
 # Runtime data and logs
 data/
 tmp/
+.tmp-go-cache/
 *.log
 *.pid
 

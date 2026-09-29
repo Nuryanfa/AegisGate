@@ -53,5 +53,11 @@ jobs:
       - name: Race test
         run: go test -race ./...
 
+      - name: Bounded fuzz smoke tests
+        run: |
+          go test ./internal/waf -run=^$ -fuzz=FuzzNormalizeQuery -fuzztime=2s
+          go test ./internal/waf -run=^$ -fuzz=FuzzInspectJSON -fuzztime=2s
+          go test ./internal/waf -run=^$ -fuzz=FuzzRuleEvaluation -fuzztime=2s
+
       - name: Build
         run: go build ./...

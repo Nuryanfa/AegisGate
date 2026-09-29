@@ -36,6 +36,19 @@ routes:
       capacity: 20
       refill_per_second: 5
       on_redis_error: deny
+    waf:
+      mode: audit
+      rule_set: core-v1
+      anomaly_threshold: 5
+      inspection:
+        query: true
+        headers: true
+        body: true
+        max_query_bytes: 8192
+        max_header_bytes: 16384
+        max_body_bytes: 1048576
+        max_json_depth: 20
+        max_json_elements: 1000
 
   - id: orders
     path_prefix: /api/orders
@@ -48,3 +61,16 @@ routes:
       capacity: 10
       refill_per_second: 2
       on_redis_error: deny
+    waf:
+      mode: enforce
+      rule_set: core-v1
+      anomaly_threshold: 5
+      inspection:
+        query: true
+        headers: true
+        body: true
+        max_query_bytes: 8192
+        max_header_bytes: 16384
+        max_body_bytes: 1048576
+        max_json_depth: 20
+        max_json_elements: 1000

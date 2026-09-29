@@ -1,6 +1,6 @@
 # AegisGate Project Memory
 
-Last updated: 2026-09-28
+Last updated: 2026-09-29
 
 This file is the durable working memory for the repository. It summarizes the
 current understanding of `PRD.md`; it does not silently turn proposals into
@@ -49,7 +49,7 @@ Sprint 0 established Go 1.25, standard-library HTTP and reverse-proxy
 components, a non-root distroless container, Docker Compose, and GitHub Actions
 CI. Its single environment-configured route was replaced by v0.2, v0.3 added
 API-client access control, and v0.4 adds Redis-backed distributed rate
-limiting. The next planned milestone is v0.5 — WAF Foundation.
+limiting. v0.5 adds bounded request inspection and a small WAF rule foundation.
 
 ## Confirmed v0.2 routing foundation
 
@@ -111,6 +111,30 @@ limiting. The next planned milestone is v0.5 — WAF Foundation.
   made.
 - The algorithm and trust boundary are recorded in ADR 0002. Real Redis script
   tests run in CI, including cross-client concurrency with no over-admission.
+
+## Confirmed v0.5 bounded WAF foundation
+
+- `waf` is optional per route. Explicit `disabled`, `audit`, and `enforce`
+  modes do not imply protection when omitted or disabled.
+- Authentication and distributed rate limiting precede inspection. A rejected
+  credential or exhausted quota does not incur body-inspection work.
+- `core-v1` has six immutable, startup-compiled rules with stable IDs,
+  anomaly scores, auditable descriptions, and documented limitations. YAML
+  cannot inject regular expressions or executable matchers.
+- Query, headers, body size, JSON depth/elements, and canonical value count are
+  bounded. Text is validated as UTF-8 without NUL and percent encoding is
+  decoded exactly once.
+- JSON, URL-encoded form, and plain text are the only inspected body types.
+  Non-empty bodies without a supported type, multipart bodies, and compressed
+  bodies are rejected. Exact buffered bytes are restored before proxying.
+- Audit matches are logged and forwarded; enforce matches at threshold return
+  `403`. Hard input/limit errors remain `400`, `413`, or `415`. Unexpected
+  internal errors fail closed in enforce and fail open with a safe warning in
+  audit.
+- Security logs contain stable metadata, never credentials, payloads, query
+  strings, arbitrary headers, raw evidence, client identity, or peer address.
+- The threat model and normalization contract are recorded in ADR 0003. This
+  milestone makes no enterprise-WAF, complete prevention, IDS, or DDoS claim.
 
 ## Critical engineering observations
 
@@ -199,3 +223,6 @@ These must be confirmed before repository scaffolding hardens them:
 - 2026-09-28: Implemented the v0.4 Redis-backed distributed token bucket on
   `feature/v0.4-distributed-rate-limiting`, with atomic Lua enforcement,
   subject hashing, explicit outage policy, and fail-closed readiness.
+- 2026-09-29: Synchronized `develop` with released tag `v0.4.0` and started
+  v0.5 on `feature/v0.5-bounded-waf`. Added bounded per-route inspection,
+  audit/enforce scoring, privacy-safe events, and ADR 0003.

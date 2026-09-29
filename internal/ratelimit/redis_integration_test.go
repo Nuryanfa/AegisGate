@@ -11,7 +11,7 @@ import (
 
 func TestRedisTokenBucketRefillIsolationAndExpiration(t *testing.T) {
 	limiter := integrationLimiter(t)
-	flushRedis(t, limiter)
+	cleanupBuckets(t, limiter, [][2]string{{"orders", "client:first"}, {"orders", "client:second"}, {"users", "client:first"}, {"expiry", "peer:192.0.2.1"}})
 	ctx := context.Background()
 	policy := mustRatePolicy(t, 2, 5, "deny")
 
@@ -54,7 +54,7 @@ func TestRedisTokenBucketRefillIsolationAndExpiration(t *testing.T) {
 
 func TestRedisTokenBucketIsAtomicAcrossLimiterInstances(t *testing.T) {
 	first := integrationLimiter(t)
-	flushRedis(t, first)
+	cleanupBuckets(t, first, [][2]string{{"shared-route", "client:shared"}})
 	second := integrationLimiter(t)
 	policy := mustRatePolicy(t, 20, 0.01, "deny")
 
@@ -91,7 +91,7 @@ func TestRedisTokenBucketIsAtomicAcrossLimiterInstances(t *testing.T) {
 
 func TestRedisTokenBucketDefendsAgainstFutureTimestamp(t *testing.T) {
 	limiter := integrationLimiter(t)
-	flushRedis(t, limiter)
+	cleanupBuckets(t, limiter, [][2]string{{"clock", "client:clock"}})
 	ctx := context.Background()
 	serverTime, err := limiter.client.Time(ctx).Result()
 	if err != nil {
@@ -132,11 +132,19 @@ func integrationLimiter(t *testing.T) *RedisLimiter {
 	return limiter
 }
 
-func flushRedis(t *testing.T, limiter *RedisLimiter) {
+func cleanupBuckets(t *testing.T, limiter *RedisLimiter, subjects [][2]string) {
 	t.Helper()
-	if err := limiter.client.FlushDB(context.Background()).Err(); err != nil {
-		t.Fatalf("FlushDB() error = %v", err)
+	keys := make([]string, 0, len(subjects))
+	for _, subject := range subjects {
+		keys = append(keys, bucketKey(subject[0], subject[1]))
 	}
+	deleteKeys := func() {
+		if err := limiter.client.Del(context.Background(), keys...).Err(); err != nil {
+			t.Errorf("delete test-owned Redis keys: %v", err)
+		}
+	}
+	deleteKeys()
+	t.Cleanup(deleteKeys)
 }
 
 func mustRatePolicy(t *testing.T, capacity int64, refill float64, mode string) Policy {

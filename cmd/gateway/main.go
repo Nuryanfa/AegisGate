@@ -12,6 +12,8 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/config"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/proxy"
+	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
+	"github.com/Nuryanfa/AegisGate/internal/router"
 	"github.com/Nuryanfa/AegisGate/internal/server"
 )
 
@@ -29,7 +31,28 @@ func main() {
 		logger.Error("build API key registry", "error", err)
 		os.Exit(1)
 	}
-	proxyHandler, err := proxy.New(cfg.Routes, registry, logger)
+	var limiter *ratelimit.RedisLimiter
+	if cfg.Redis != nil {
+		limiter, err = ratelimit.NewRedisLimiter(ratelimit.RedisOptions{
+			Address:        cfg.Redis.Address,
+			Username:       cfg.Redis.Username,
+			Password:       cfg.Redis.Password,
+			Database:       cfg.Redis.Database,
+			ConnectTimeout: cfg.Redis.ConnectTimeout,
+			CommandTimeout: cfg.Redis.CommandTimeout,
+			PoolSize:       cfg.Redis.PoolSize,
+		})
+		if err != nil {
+			logger.Error("build Redis rate limiter", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := limiter.Close(); err != nil {
+				logger.Warn("close Redis client", "error", err)
+			}
+		}()
+	}
+	proxyHandler, err := proxy.NewWithRateLimiter(cfg.Routes, registry, limiter, logger)
 	if err != nil {
 		logger.Error("build gateway routes", "error", err)
 		os.Exit(1)
@@ -37,7 +60,11 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.HealthHandler)
-	mux.Handle("/readyz", server.ReadinessHandler())
+	readinessChecks := make([]server.ReadinessCheck, 0, 1)
+	if limiter != nil && hasFailClosedRateLimit(cfg.Routes) {
+		readinessChecks = append(readinessChecks, limiter.Ping)
+	}
+	mux.Handle("/readyz", server.ReadinessHandler(readinessChecks...))
 	mux.Handle("/", proxyHandler)
 
 	handler := middleware.RequestID(middleware.Logging(logger, mux))
@@ -55,11 +82,31 @@ func main() {
 		"environment", cfg.Environment,
 		"route_count", len(cfg.Routes),
 		"api_key_count", len(cfg.APIKeys),
+		"rate_limited_route_count", rateLimitedRouteCount(cfg.Routes),
 	)
 	if err := httpServer.Run(ctx, cfg.ShutdownTimeout); err != nil {
 		logger.Error("gateway stopped with an error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func hasFailClosedRateLimit(routes []router.Route) bool {
+	for _, route := range routes {
+		if route.RateLimit != nil && route.RateLimit.FailClosed() {
+			return true
+		}
+	}
+	return false
+}
+
+func rateLimitedRouteCount(routes []router.Route) int {
+	count := 0
+	for _, route := range routes {
+		if route.RateLimit != nil {
+			count++
+		}
+	}
+	return count
 }
 
 func newLogger(environment string) *slog.Logger {

@@ -64,6 +64,9 @@ routes:
 	if cfg.Routes[0].Auth.RequiresAPIKey() || !cfg.Routes[1].Auth.RequiresAPIKey() {
 		t.Fatalf("route access policies were not loaded correctly")
 	}
+	if cfg.Redis != nil || cfg.Routes[0].RateLimit != nil || cfg.Routes[1].RateLimit != nil {
+		t.Fatal("omitted rate-limit policy unexpectedly enabled Redis or limiting")
+	}
 	if cfg.Routes[0].PathPrefix != "/api/users" || cfg.Routes[0].Timeout != 750*time.Millisecond {
 		t.Fatalf("first route = %#v", cfg.Routes[0])
 	}
@@ -89,6 +92,34 @@ func TestLoadRequiresReadableConfiguration(t *testing.T) {
 	})
 }
 
+func TestLoadValidRateLimitAndRedisConfiguration(t *testing.T) {
+	prepareEnvironment(t)
+	t.Setenv("AEGIS_REDIS_USERNAME", "gateway")
+	t.Setenv("AEGIS_REDIS_PASSWORD", "runtime-only-secret")
+	t.Setenv("AEGIS_CONFIG_PATH", writeConfig(t, rateLimitedConfig(
+		"redis:\n  address: localhost:6379\n  database: 2\n  connect_timeout: 1s\n  command_timeout: 250ms\n  pool_size: 25\n",
+		"    rate_limit:\n      capacity: 20\n      refill_per_second: 5\n      on_redis_error: deny\n",
+	)))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Redis == nil {
+		t.Fatal("Redis configuration was not loaded")
+	}
+	if cfg.Redis.Address != "localhost:6379" || cfg.Redis.Database != 2 ||
+		cfg.Redis.ConnectTimeout != time.Second || cfg.Redis.CommandTimeout != 250*time.Millisecond || cfg.Redis.PoolSize != 25 {
+		t.Fatalf("Redis configuration = %#v", cfg.Redis)
+	}
+	if cfg.Redis.Username != "gateway" || cfg.Redis.Password != "runtime-only-secret" {
+		t.Fatal("Redis credentials were not sourced from environment")
+	}
+	if cfg.Routes[0].RateLimit == nil || cfg.Routes[0].RateLimit.Capacity() != 20 || !cfg.Routes[0].RateLimit.FailClosed() {
+		t.Fatalf("route rate-limit policy = %#v", cfg.Routes[0].RateLimit)
+	}
+}
+
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -101,6 +132,21 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "no routes", configuration: "routes: []\n", wantError: "at least one route"},
 		{name: "invalid server timeout", configuration: "server:\n  read_timeout: 0s\n" + validConfig(), wantError: "must be greater than zero"},
 		{name: "route timeout equals write timeout", configuration: "server:\n  write_timeout: 5s\n" + validConfig(), wantError: "must be less than server.write_timeout"},
+		{name: "rate limit without Redis", configuration: rateLimitedConfig("", validRateLimitYAML()), wantError: "redis configuration is required"},
+		{name: "unused Redis", configuration: "redis:\n  address: localhost:6379\n" + validConfig(), wantError: "redis configuration is unused"},
+		{name: "invalid Redis address", configuration: rateLimitedConfig("redis:\n  address: redis\n", validRateLimitYAML()), wantError: "host:port"},
+		{name: "invalid Redis port", configuration: rateLimitedConfig("redis:\n  address: redis:70000\n", validRateLimitYAML()), wantError: "valid TCP port"},
+		{name: "negative Redis database", configuration: rateLimitedConfig("redis:\n  address: redis:6379\n  database: -1\n", validRateLimitYAML()), wantError: "between 0 and 1024"},
+		{name: "excessive Redis timeout", configuration: rateLimitedConfig("redis:\n  address: redis:6379\n  command_timeout: 11s\n", validRateLimitYAML()), wantError: "must not exceed 10s"},
+		{name: "negative Redis pool", configuration: rateLimitedConfig("redis:\n  address: redis:6379\n  pool_size: -1\n", validRateLimitYAML()), wantError: "pool_size must be between"},
+		{name: "excessive Redis pool", configuration: rateLimitedConfig("redis:\n  address: redis:6379\n  pool_size: 1001\n", validRateLimitYAML()), wantError: "pool_size must be between"},
+		{name: "zero rate capacity", configuration: rateLimitedConfig(validRedisYAML(), strings.Replace(validRateLimitYAML(), "capacity: 20", "capacity: 0", 1)), wantError: "capacity must be between"},
+		{name: "excessive rate capacity", configuration: rateLimitedConfig(validRedisYAML(), strings.Replace(validRateLimitYAML(), "capacity: 20", "capacity: 1000001", 1)), wantError: "capacity must be between"},
+		{name: "zero refill", configuration: rateLimitedConfig(validRedisYAML(), strings.Replace(validRateLimitYAML(), "refill_per_second: 5", "refill_per_second: 0", 1)), wantError: "refill_per_second must be between"},
+		{name: "missing Redis failure mode", configuration: rateLimitedConfig(validRedisYAML(), strings.Replace(validRateLimitYAML(), "      on_redis_error: deny\n", "", 1)), wantError: "on_redis_error is required"},
+		{name: "unknown Redis failure mode", configuration: rateLimitedConfig(validRedisYAML(), strings.Replace(validRateLimitYAML(), "deny", "maybe", 1)), wantError: "unsupported on_redis_error"},
+		{name: "unknown rate-limit field", configuration: rateLimitedConfig(validRedisYAML(), validRateLimitYAML()+"      typo: true\n"), wantError: "field typo not found"},
+		{name: "unknown Redis field", configuration: rateLimitedConfig("redis:\n  address: redis:6379\n  password: do-not-leak\n", validRateLimitYAML()), wantError: "field password not found"},
 		{
 			name: "duplicate IDs",
 			configuration: routesConfig(
@@ -247,9 +293,30 @@ func prepareEnvironment(t *testing.T) {
 		"AEGIS_IDLE_TIMEOUT",
 		"AEGIS_SHUTDOWN_TIMEOUT",
 		"AEGIS_UPSTREAM_URL",
+		"AEGIS_REDIS_USERNAME",
+		"AEGIS_REDIS_PASSWORD",
 	} {
 		unsetEnv(t, key)
 	}
+}
+
+func rateLimitedConfig(redisConfiguration, rateLimitConfiguration string) string {
+	return redisConfiguration + "routes:\n" +
+		"  - id: users\n" +
+		"    path_prefix: /api/users\n" +
+		"    upstream: http://localhost:8081\n" +
+		"    timeout: 5s\n" +
+		"    auth:\n" +
+		"      mode: public\n" +
+		rateLimitConfiguration
+}
+
+func validRedisYAML() string {
+	return "redis:\n  address: redis:6379\n  connect_timeout: 2s\n  command_timeout: 500ms\n"
+}
+
+func validRateLimitYAML() string {
+	return "    rate_limit:\n      capacity: 20\n      refill_per_second: 5\n      on_redis_error: deny\n"
 }
 
 func unsetEnv(t *testing.T, key string) {

@@ -1,4 +1,4 @@
-.PHONY: run run-upstream run-users run-orders generate-key build test test-race fmt vet tidy check
+.PHONY: run run-upstream run-users run-orders generate-key build test test-integration test-race fmt vet tidy check
 
 run:
 	AEGIS_CONFIG_PATH=configs/config.example.yaml go run ./cmd/gateway
@@ -20,6 +20,9 @@ build:
 
 test:
 	go test ./...
+
+test-integration:
+	AEGIS_REDIS_INTEGRATION_ADDR=$${AEGIS_REDIS_INTEGRATION_ADDR:-127.0.0.1:6379} go test -count=1 -v ./internal/ratelimit
 
 test-race:
 	go test -race ./...

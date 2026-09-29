@@ -6,6 +6,13 @@ server:
   idle_timeout: 60s
   shutdown_timeout: 10s
 
+redis:
+  address: redis:6379
+  database: 0
+  connect_timeout: 2s
+  command_timeout: 500ms
+  pool_size: 20
+
 # Non-working placeholders; use a gitignored local config for real demo keys.
 api_keys:
   - id: orders-client
@@ -23,6 +30,10 @@ routes:
     timeout: 5s
     auth:
       mode: public
+    rate_limit:
+      capacity: 5
+      refill_per_second: 1
+      on_redis_error: deny
 
   - id: orders
     path_prefix: /api/orders
@@ -31,3 +42,7 @@ routes:
     auth:
       mode: api_key
       required_scopes: [orders:read]
+    rate_limit:
+      capacity: 3
+      refill_per_second: 1
+      on_redis_error: deny

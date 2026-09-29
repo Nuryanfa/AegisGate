@@ -6,13 +6,42 @@ services:
       target: gateway
     environment:
       AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
+      AEGIS_REDIS_USERNAME: ${AEGIS_REDIS_USERNAME:-}
+      AEGIS_REDIS_PASSWORD: ${AEGIS_REDIS_PASSWORD:-}
     volumes:
       - ${AEGIS_CONFIG_FILE:-./configs/config.docker.yaml}:/etc/aegisgate/config.yaml:ro
     ports:
       - "8080:8080"
     depends_on:
-      - users-upstream
-      - orders-upstream
+      users-upstream:
+        condition: service_started
+      orders-upstream:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    init: true
+
+  gateway-secondary:
+    profiles: ["distributed-demo"]
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: gateway
+    environment:
+      AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
+      AEGIS_REDIS_USERNAME: ${AEGIS_REDIS_USERNAME:-}
+      AEGIS_REDIS_PASSWORD: ${AEGIS_REDIS_PASSWORD:-}
+    volumes:
+      - ${AEGIS_CONFIG_FILE:-./configs/config.docker.yaml}:/etc/aegisgate/config.yaml:ro
+    ports:
+      - "8083:8080"
+    depends_on:
+      users-upstream:
+        condition: service_started
+      orders-upstream:
+        condition: service_started
+      redis:
+        condition: service_healthy
     init: true
 
   users-upstream:
@@ -38,3 +67,14 @@ services:
     expose:
       - "8081"
     init: true
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 15

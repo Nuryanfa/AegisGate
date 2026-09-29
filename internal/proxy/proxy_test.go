@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
+	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 )
 
@@ -428,6 +430,128 @@ func TestProtectedChildCannotBypassThroughPublicParentRoute(t *testing.T) {
 	}
 }
 
+func TestRateLimitUsesValidatedClientIdentityAndRejectsBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	limiter := &stubRateLimiter{decision: ratelimit.Decision{Allowed: false, RetryAfter: 1250 * time.Millisecond}}
+	policy := rateLimitPolicy(t, 1, 1, "deny")
+	handler, err := NewWithRateLimiter([]router.Route{{
+		ID: "orders", PathPrefix: "/api/orders", Upstream: upstream.URL, Timeout: time.Second,
+		Auth: protectedPolicy(t, "orders:read"), RateLimit: &policy,
+	}}, registryForCredential(t, proxyTestCredential, []string{"orders:read"}), limiter, discardLogger())
+	if err != nil {
+		t.Fatalf("NewWithRateLimiter() error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/orders", nil)
+	request.Header.Set(auth.HeaderName, proxyTestCredential)
+	request.Header.Set("X-Aegis-Client-ID", "spoofed")
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, request)
+
+	assertJSONError(t, response, http.StatusTooManyRequests, "RATE_LIMITED")
+	if got := response.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	if limiter.subject != "client:test-client" {
+		t.Fatalf("limiter subject = %q, want authenticated client identity", limiter.subject)
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("rate-limited request reached upstream")
+	}
+}
+
+func TestPublicRateLimitUsesDirectPeerAndIgnoresForwardingHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	limiter := &stubRateLimiter{decision: ratelimit.Decision{Allowed: true}}
+	policy := rateLimitPolicy(t, 2, 1, "deny")
+	route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
+	route.RateLimit = &policy
+	handler, err := NewWithRateLimiter([]router.Route{route}, emptyRegistry(t), limiter, discardLogger())
+	if err != nil {
+		t.Fatalf("NewWithRateLimiter() error = %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	request.RemoteAddr = "203.0.113.9:54321"
+	request.Header.Set("X-Forwarded-For", "198.51.100.50")
+	request.Header.Set("X-Real-IP", "198.51.100.51")
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.Code)
+	}
+	if limiter.subject != "peer:203.0.113.9" {
+		t.Fatalf("limiter subject = %q, want direct peer", limiter.subject)
+	}
+}
+
+func TestAuthenticationFailureIsNotChargedToRateLimiter(t *testing.T) {
+	policy := rateLimitPolicy(t, 1, 1, "deny")
+	limiter := &stubRateLimiter{decision: ratelimit.Decision{Allowed: true}}
+	handler, err := NewWithRateLimiter([]router.Route{{
+		ID: "orders", PathPrefix: "/api/orders", Upstream: "http://orders.example", Timeout: time.Second,
+		Auth: protectedPolicy(t, "orders:read"), RateLimit: &policy,
+	}}, registryForCredential(t, proxyTestCredential, []string{"orders:read"}), limiter, discardLogger())
+	if err != nil {
+		t.Fatalf("NewWithRateLimiter() error = %v", err)
+	}
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/orders", nil))
+	assertJSONError(t, response, http.StatusUnauthorized, "UNAUTHORIZED")
+	if limiter.calls.Load() != 0 {
+		t.Fatal("invalid credential attempt was charged to authenticated-client limiter")
+	}
+}
+
+func TestRateLimiterRedisFailureModes(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		mode       string
+		wantStatus int
+		wantCalls  int32
+	}{
+		{name: "deny", mode: "deny", wantStatus: http.StatusServiceUnavailable, wantCalls: 0},
+		{name: "allow", mode: "allow", wantStatus: http.StatusNoContent, wantCalls: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+			policy := rateLimitPolicy(t, 1, 1, tt.mode)
+			route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
+			route.RateLimit = &policy
+			handler, err := NewWithRateLimiter([]router.Route{route}, emptyRegistry(t), &stubRateLimiter{err: errors.New("Redis unavailable")}, discardLogger())
+			if err != nil {
+				t.Fatalf("NewWithRateLimiter() error = %v", err)
+			}
+			response := httptest.NewRecorder()
+			middleware.RequestID(handler).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/users", nil))
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, tt.wantStatus)
+			}
+			if tt.wantStatus == http.StatusServiceUnavailable {
+				assertJSONError(t, response, http.StatusServiceUnavailable, "RATE_LIMIT_UNAVAILABLE")
+			}
+			if upstreamCalls.Load() != tt.wantCalls {
+				t.Fatalf("upstream calls = %d, want %d", upstreamCalls.Load(), tt.wantCalls)
+			}
+		})
+	}
+}
+
 func upstreamNameHandler(name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, name+":"+r.URL.Path)
@@ -479,6 +603,30 @@ func registryForCredential(t *testing.T, plaintext string, scopes []string) *aut
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
 	return registry
+}
+
+func rateLimitPolicy(t *testing.T, capacity int64, refill float64, mode string) ratelimit.Policy {
+	t.Helper()
+	policy, err := ratelimit.NewPolicy(capacity, refill, mode)
+	if err != nil {
+		t.Fatalf("ratelimit.NewPolicy() error = %v", err)
+	}
+	return policy
+}
+
+type stubRateLimiter struct {
+	decision ratelimit.Decision
+	err      error
+	calls    atomic.Int32
+	routeID  string
+	subject  string
+}
+
+func (l *stubRateLimiter) Allow(_ context.Context, routeID, subject string, _ ratelimit.Policy) (ratelimit.Decision, error) {
+	l.calls.Add(1)
+	l.routeID = routeID
+	l.subject = subject
+	return l.decision, l.err
 }
 
 func assertJSONError(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode string) {

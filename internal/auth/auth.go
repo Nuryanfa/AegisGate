@@ -45,6 +45,7 @@ type Key struct {
 }
 
 type registryKey struct {
+	id     string
 	digest [sha256.Size]byte
 	scopes map[string]struct{}
 }
@@ -52,6 +53,15 @@ type registryKey struct {
 // Registry is immutable after construction and safe for concurrent requests.
 type Registry struct {
 	keys []registryKey
+}
+
+// Identity is produced only after successful API-key authentication.
+type Identity struct {
+	clientID string
+}
+
+func (i Identity) ClientID() (string, bool) {
+	return i.clientID, i.clientID != ""
 }
 
 func NewPolicy(rawMode string, requiredScopes []string) (Policy, error) {
@@ -136,24 +146,24 @@ func NewRegistry(keys []Key) (*Registry, error) {
 		for _, scope := range scopes {
 			scopeSet[scope] = struct{}{}
 		}
-		registryKeys = append(registryKeys, registryKey{digest: key.digest, scopes: scopeSet})
+		registryKeys = append(registryKeys, registryKey{id: key.id, digest: key.digest, scopes: scopeSet})
 	}
 
 	return &Registry{keys: registryKeys}, nil
 }
 
 // Authorize authenticates one API client and enforces all route scopes.
-func (r *Registry) Authorize(policy Policy, headers http.Header) error {
+func (r *Registry) Authorize(policy Policy, headers http.Header) (Identity, error) {
 	if policy.mode == ModePublic {
-		return nil
+		return Identity{}, nil
 	}
 	if policy.mode != ModeAPIKey {
-		return ErrUnauthenticated
+		return Identity{}, ErrUnauthenticated
 	}
 
 	credential, err := credential(headers.Values(HeaderName))
 	if err != nil {
-		return ErrUnauthenticated
+		return Identity{}, ErrUnauthenticated
 	}
 	digest := sha256.Sum256([]byte(credential))
 
@@ -165,15 +175,15 @@ func (r *Registry) Authorize(policy Policy, headers http.Header) error {
 		found |= matches
 	}
 	if found != 1 {
-		return ErrUnauthenticated
+		return Identity{}, ErrUnauthenticated
 	}
 
 	for _, required := range policy.requiredScopes {
 		if _, ok := r.keys[selected].scopes[required]; !ok {
-			return ErrForbidden
+			return Identity{}, ErrForbidden
 		}
 	}
-	return nil
+	return Identity{clientID: r.keys[selected].id}, nil
 }
 
 func credential(values []string) (string, error) {

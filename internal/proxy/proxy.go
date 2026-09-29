@@ -9,11 +9,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
+	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 )
 
@@ -22,14 +26,30 @@ type Handler struct {
 	router  *router.Router
 	proxies map[string]http.Handler
 	auth    *auth.Registry
+	limiter RateLimiter
+	logger  *slog.Logger
+}
+
+type RateLimiter interface {
+	Allow(context.Context, string, string, ratelimit.Policy) (ratelimit.Decision, error)
 }
 
 var errRouteTimeout = errors.New("route timeout exceeded")
 
 // New validates routes and builds one reverse proxy per upstream route.
 func New(routes []router.Route, registry *auth.Registry, logger *slog.Logger) (*Handler, error) {
+	return NewWithRateLimiter(routes, registry, nil, logger)
+}
+
+// NewWithRateLimiter builds a proxy pipeline with optional Redis-backed rate limiting.
+func NewWithRateLimiter(routes []router.Route, registry *auth.Registry, limiter RateLimiter, logger *slog.Logger) (*Handler, error) {
 	if registry == nil {
 		return nil, errors.New("API key registry must not be nil")
+	}
+	for _, route := range routes {
+		if route.RateLimit != nil && limiter == nil {
+			return nil, fmt.Errorf("route %q enables rate limiting but no limiter is configured", route.ID)
+		}
 	}
 	routeTable, err := router.New(routes)
 	if err != nil {
@@ -54,7 +74,7 @@ func New(routes []router.Route, registry *auth.Registry, logger *slog.Logger) (*
 		proxies[route.ID] = reverseProxy(upstream, logger)
 	}
 
-	return &Handler{router: routeTable, proxies: proxies, auth: registry}, nil
+	return &Handler{router: routeTable, proxies: proxies, auth: registry, limiter: limiter, logger: logger}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +83,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "ROUTE_NOT_FOUND", "no route configured for request", middleware.RequestIDFromContext(r.Context()))
 		return
 	}
-	if err := h.auth.Authorize(route.Auth, r.Header); err != nil {
+	identity, err := h.auth.Authorize(route.Auth, r.Header)
+	if err != nil {
 		requestID := middleware.RequestIDFromContext(r.Context())
 		if errors.Is(err, auth.ErrForbidden) {
 			writeError(w, http.StatusForbidden, "FORBIDDEN", "API key lacks required scope", requestID)
@@ -72,10 +93,64 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "valid API key required", requestID)
 		return
 	}
+	if route.RateLimit != nil {
+		subject, err := rateLimitSubject(route, identity, r.RemoteAddr)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_UNAVAILABLE", "rate-limit service unavailable", middleware.RequestIDFromContext(r.Context()))
+			return
+		}
+		decision, err := h.limiter.Allow(r.Context(), route.ID, subject, *route.RateLimit)
+		if err != nil {
+			if route.RateLimit.FailureMode() == ratelimit.FailureAllow {
+				h.logger.WarnContext(r.Context(), "rate limiter unavailable; request allowed by policy",
+					"request_id", middleware.RequestIDFromContext(r.Context()),
+					"route_id", route.ID,
+					"error", err,
+				)
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "RATE_LIMIT_UNAVAILABLE", "rate-limit service unavailable", middleware.RequestIDFromContext(r.Context()))
+				return
+			}
+		} else if !decision.Allowed {
+			w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds(decision.RetryAfter), 10))
+			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "rate limit exceeded", middleware.RequestIDFromContext(r.Context()))
+			return
+		}
+	}
 
 	ctx, cancel := context.WithTimeoutCause(r.Context(), route.Timeout, errRouteTimeout)
 	defer cancel()
 	h.proxies[route.ID].ServeHTTP(w, r.WithContext(ctx))
+}
+
+func rateLimitSubject(route router.Route, identity auth.Identity, remoteAddr string) (string, error) {
+	if route.Auth.RequiresAPIKey() {
+		clientID, ok := identity.ClientID()
+		if !ok {
+			return "", errors.New("authenticated route has no client identity")
+		}
+		return "client:" + clientID, nil
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return "", errors.New("direct peer address is invalid")
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return "", errors.New("direct peer IP is invalid")
+	}
+	return "peer:" + address.Unmap().String(), nil
+}
+
+func retryAfterSeconds(value time.Duration) int64 {
+	if value <= 0 {
+		return 1
+	}
+	seconds := int64((value + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func reverseProxy(upstream *url.URL, logger *slog.Logger) *httputil.ReverseProxy {

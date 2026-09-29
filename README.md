@@ -1,8 +1,8 @@
 # AegisGate
 
 AegisGate is a portfolio-grade API gateway and security platform written in
-Go. v0.3 adds API-client authentication and route-scope authorization to the
-strictly configured v0.2 gateway.
+Go. v0.4 adds Redis-backed distributed token-bucket rate limiting to the
+authenticated and strictly configured v0.3 gateway.
 
 This is an educational, production-like project, not a claim of production
 readiness. An API key identifies a calling application, not a human user.
@@ -14,10 +14,12 @@ readiness. An API key identifies a calling application, not a human user.
 - Boundary-aware longest-prefix routing and per-route deadlines
 - Explicit public or API-key-protected routes
 - SHA-256-only key registry with all-required scope authorization
-- JSON `401`, `403`, `404`, `502`, and `504` errors
+- Atomic Redis token buckets shared across gateway instances
+- Explicit per-route fail-open or fail-closed Redis behavior
+- JSON `401`, `403`, `404`, `429`, `502`, `503`, and `504` errors
 - Request IDs, structured logs, forwarding-header sanitization, health checks,
   graceful shutdown, and race-oriented tests
-- Non-root image and three-service Compose demo
+- Non-root image and Compose demo with internal-only Redis
 
 Go 1.25.x is required. Docker Compose is needed only for the container demo.
 
@@ -32,11 +34,20 @@ environment variable -> YAML server value -> built-in default
 
 Supported overrides are `AEGIS_ENV`, `AEGIS_HTTP_ADDR`,
 `AEGIS_READ_TIMEOUT`, `AEGIS_WRITE_TIMEOUT`, `AEGIS_IDLE_TIMEOUT`, and
-`AEGIS_SHUTDOWN_TIMEOUT`. Removed v0.1 variable `AEGIS_UPSTREAM_URL` is rejected.
+`AEGIS_SHUTDOWN_TIMEOUT`. Redis ACL credentials, when needed, come only from
+`AEGIS_REDIS_USERNAME` and `AEGIS_REDIS_PASSWORD`. They are never stored in
+committed YAML. Removed v0.1 variable `AEGIS_UPSTREAM_URL` is rejected.
 
 ```yaml
 server:
   write_timeout: 15s
+
+redis:
+  address: localhost:6379
+  database: 0
+  connect_timeout: 2s
+  command_timeout: 500ms
+  pool_size: 20
 
 api_keys:
   - id: orders-client
@@ -50,6 +61,10 @@ routes:
     timeout: 5s
     auth:
       mode: public
+    rate_limit:
+      capacity: 20
+      refill_per_second: 5
+      on_redis_error: deny
 
   - id: orders
     path_prefix: /api/orders
@@ -58,6 +73,10 @@ routes:
     auth:
       mode: api_key
       required_scopes: [orders:read]
+    rate_limit:
+      capacity: 10
+      refill_per_second: 2
+      on_redis_error: deny
 ```
 
 Every route must explicitly choose `public` or `api_key`. Public routes cannot
@@ -70,6 +89,34 @@ Only a SHA-256 digest belongs in configuration. Key IDs, digests, route IDs,
 prefixes, and scopes are validated; duplicates and unknown YAML fields fail
 startup. A protected route is invalid when `api_keys` is empty. Configuration,
 rotation, and revocation are restart-only; hot reload is not implemented.
+
+### Rate-limit semantics
+
+`rate_limit` is optional. If it is omitted, that route has no rate limiting.
+When any route enables it, the top-level `redis` block is required.
+Redis dial/command durations are bounded to ten seconds, and `pool_size`
+explicitly caps the gateway's Redis connections (default 20, maximum 1000).
+
+- `capacity` is the maximum number of tokens and therefore the maximum burst.
+- `refill_per_second` is the number of tokens restored per second; positive
+  decimal values are supported.
+- Every allowed request consumes one token.
+- `on_redis_error: deny` returns `503`; `allow` forwards the request while
+  quota enforcement is unavailable. There is no implicit fail-open behavior.
+
+Buckets start full and are independent per route. Authenticated routes use the
+validated API-client ID. Public routes use the direct socket peer IP and never
+trust forwarding headers. Raw subjects and credentials are not placed in Redis
+keys. Redis server time is the shared clock, and one Lua operation atomically
+refills, decides, consumes, and expires bucket state.
+
+An exhausted bucket returns JSON `429` with `Retry-After` rounded up to whole
+seconds until one token should be available. Inactive state expires after twice
+the time needed to refill an empty bucket, between one second and 24 hours.
+
+`/healthz` remains process-only liveness. `/readyz` returns `503` when Redis is
+unavailable and at least one route uses fail-closed `deny`. A configuration
+containing only fail-open policies remains ready during that outage.
 
 ### Routing and timeouts
 
@@ -99,17 +146,17 @@ Committed example digests are deliberately non-working placeholders. Copy
 `configs/config.example.yaml` to the gitignored `configs/local.yaml`, generate
 two keys, and grant `orders:read` to only one to run the full demo.
 
-### Migrate from v0.2
+### Migrate from v0.3
 
-Add an `auth` block to every existing route; choose `mode: public` to preserve
-its previous open behavior. For routes that should be protected, choose
-`mode: api_key`, declare at least one `required_scopes` entry, generate a key,
-and add only its digest plus at least one scope under `api_keys`. Restart the
-gateway after changing the file. An omitted mode intentionally fails startup.
+Existing v0.3 files remain valid and have no rate limiting. To enable v0.4,
+add the top-level `redis` settings and a `rate_limit` block to each route that
+needs a quota. Choose `on_redis_error` deliberately. Restart all gateways after
+changing policy; configuration is still startup-only.
 
 ## Run locally
 
-Start two upstreams in separate PowerShell terminals:
+Start Redis and two upstreams in separate terminals. For example, use your
+local Redis installation on `localhost:6379`, then run:
 
 ```powershell
 $env:EXAMPLE_SERVICE_NAME="users-upstream"
@@ -138,13 +185,15 @@ curl -i -H "X-API-Key: $ORDERS_API_KEY" http://localhost:8080/api/orders/99
 ```
 
 Expected statuses are `200`, `401`, `403`, and `200`. Health and readiness
-remain public gateway-owned endpoints.
+remain public gateway-owned endpoints. Repeated public requests eventually
+return `429`; the exact point depends on refill timing and configured capacity.
 
 ## Run with Docker
 
-The default Compose file demonstrates public access and protected rejection;
-its placeholder digests match no real key. For all outcomes, keep Compose
-service-name upstream URLs in `configs/local.yaml` and run:
+The default Compose file starts Redis without publishing its port. It
+demonstrates public limiting and protected rejection; committed API-key digests
+remain non-working placeholders. For authenticated demonstrations, keep
+Compose service-name upstream URLs in gitignored `configs/local.yaml` and run:
 
 ```powershell
 $env:AEGIS_CONFIG_FILE="./configs/local.yaml"
@@ -154,19 +203,66 @@ docker compose up --build
 Only gateway port `8080` is published. Stop with `Ctrl+C` or
 `docker compose down`.
 
+Public exhaustion:
+
+```powershell
+1..7 | ForEach-Object { curl.exe -s -o NUL -w "%{http_code}`n" http://localhost:8080/api/users/42 }
+```
+
+For an authenticated route, send the valid local key four times against the
+Docker demo policy (`capacity: 3`) to observe `200, 200, 200, 429`. A second
+valid key with the same scope gets its own independent bucket.
+
+To demonstrate two gateways sharing one bucket:
+
+```powershell
+docker compose --profile distributed-demo up --build
+curl.exe -i http://localhost:8080/api/users/42
+curl.exe -i http://localhost:8083/api/users/42
+```
+
+Alternate requests between ports `8080` and `8083`; together they exhaust the
+single Redis bucket when both containers observe the same direct peer. The
+deterministic cross-instance demonstration uses an authenticated client:
+
+```powershell
+$ports = @(8080, 8083, 8080, 8083)
+$ports | ForEach-Object { curl.exe -s -o NUL -w "%{http_code}`n" -H "X-API-Key: $env:ORDERS_API_KEY" "http://localhost:$($_)/api/orders/42" }
+```
+
+With the Docker capacity of three, this prints `200, 200, 200, 429`. Generate a
+second key, configure it with `orders:read`, restart, and send one request with
+that key to see an independent `200`. Depending on Docker's NAT path, the direct
+peer observed for public requests can differ between gateway containers; the
+authenticated client ID is therefore the reproducible shared subject.
+
+Failure behavior for the committed fail-closed demo:
+
+```powershell
+docker compose stop redis
+curl.exe -i http://localhost:8080/readyz
+curl.exe -i http://localhost:8080/api/users/42
+```
+
+Both return `503`; `/healthz` remains `200`. Change a route explicitly to
+`on_redis_error: allow` to demonstrate forwarding during the outage.
+
 ## Security model
 
 Authorization follows one route match and precedes upstream work. A protected
 child cannot bypass policy through a public parent. `X-API-Key`, `Forwarded`,
 arbitrary `X-Forwarded-*`, `X-Real-IP`, and client-supplied `X-Aegis-*` headers
-are removed or rebuilt before proxying. v0.3 forwards no identity assertion.
+are removed or rebuilt before proxying. AegisGate forwards no identity
+assertion.
 
 API keys are bearer credentials. Use TLS outside local development, distribute
-keys securely, rotate them, and monitor use. v0.3 has no end-user identity,
-expiry, automatic rotation, instant revocation, tenant isolation, ownership
-checks, rate limiting, WAF, or remote control plane. Upstreams remain
-responsible for user authorization. See
-[`ADR 0001`](docs/adr/0001-api-client-key-trust-model.md).
+keys securely, rotate them, and monitor use. Rate limiting does not prevent
+DDoS attacks and does not replace user authorization. Public IP quotas group
+users behind NAT and are not proxy-aware because no trusted-proxy model exists.
+Invalid-key attempts are rejected before authenticated-client charging; a
+separate direct-peer brute-force limiter is deferred. See
+[`ADR 0001`](docs/adr/0001-api-client-key-trust-model.md) and
+[`ADR 0002`](docs/adr/0002-redis-token-bucket-rate-limiting.md).
 
 ## Checks
 
@@ -175,6 +271,13 @@ go test ./...
 go test -race ./...
 go vet ./...
 go build ./...
+```
+
+Real Redis script tests require `AEGIS_REDIS_INTEGRATION_ADDR`, for example:
+
+```powershell
+$env:AEGIS_REDIS_INTEGRATION_ADDR="127.0.0.1:6379"
+go test -count=1 -v ./internal/ratelimit
 ```
 
 Make targets include `generate-key`, `fmt`, `tidy`, `check`, `test-race`, and
@@ -189,9 +292,10 @@ start from `develop`. Promote milestones only after validation and review.
 | --- | --- | --- |
 | v0.1 | Gateway foundation | Implemented |
 | v0.2 | Configurable routing and timeouts | Implemented |
-| v0.3 | API-client authentication and route authorization | Implemented on feature branch |
-| v0.4 | Bounded rate limiting with explicit failure behavior | Next |
-| v0.5–v0.8 | WAF, detection, observability, distributed deployment | Planned |
+| v0.3 | API-client authentication and route authorization | Implemented |
+| v0.4 | Redis-backed distributed rate limiting | Implemented on feature branch |
+| v0.5 | Bounded request inspection and WAF rules | Next |
+| v0.6–v0.8 | Detection, observability, distributed deployment | Planned |
 
 ## License
 

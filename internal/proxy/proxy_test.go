@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
 
 const proxyTestCredential = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef"
@@ -552,6 +554,186 @@ func TestRateLimiterRedisFailureModes(t *testing.T) {
 	}
 }
 
+func TestWAFAuditAndEnforcePipeline(t *testing.T) {
+	tests := []struct {
+		mode         string
+		wantStatus   int
+		wantUpstream int32
+	}{
+		{"audit", http.StatusAccepted, 1},
+		{"enforce", http.StatusForbidden, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer upstream.Close()
+			route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
+			policy := proxyWAFPolicy(t, tt.mode, 5, false)
+			route.WAF = &policy
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			handler, err := NewWithPolicies([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), logger)
+			if err != nil {
+				t.Fatalf("NewWithPolicies() error = %v", err)
+			}
+			request := httptest.NewRequest(http.MethodGet, "/api/users?q=1%27+OR+1%3D1--", nil)
+			request.Header.Set(auth.HeaderName, "secret-must-not-appear")
+			response := httptest.NewRecorder()
+			middleware.RequestID(handler).ServeHTTP(response, request)
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, tt.wantStatus)
+			}
+			if upstreamCalls.Load() != tt.wantUpstream {
+				t.Fatalf("upstream calls = %d, want %d", upstreamCalls.Load(), tt.wantUpstream)
+			}
+			if !strings.Contains(logs.String(), "AG-1001") || strings.Contains(logs.String(), "secret-must-not-appear") || strings.Contains(logs.String(), "OR 1=1") {
+				t.Fatalf("unsafe or incomplete security log: %s", logs.String())
+			}
+			if tt.mode == "enforce" {
+				assertJSONError(t, response, http.StatusForbidden, "WAF_BLOCKED")
+			}
+		})
+	}
+}
+
+func TestWAFBodyIsRestoredBeforeProxyingAndOversizeNeverReachesUpstream(t *testing.T) {
+	var gotBody []byte
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
+	policy := proxyWAFPolicy(t, "audit", 5, true)
+	route.WAF = &policy
+	handler, err := NewWithPolicies([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), discardLogger())
+	if err != nil {
+		t.Fatalf("NewWithPolicies() error = %v", err)
+	}
+	body := []byte(`{"name":"O'Connor","comparison":"a < b"}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/users", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || !bytes.Equal(gotBody, body) {
+		t.Fatalf("status/body = %d/%q, want exact %q", response.Code, gotBody, body)
+	}
+
+	oversize := httptest.NewRequest(http.MethodPost, "/api/users", strings.NewReader(strings.Repeat("x", 257)))
+	oversize.Header.Set("Content-Type", "text/plain")
+	response = httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, oversize)
+	assertJSONError(t, response, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE")
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("oversize request reached upstream; calls = %d", upstreamCalls.Load())
+	}
+}
+
+func TestWAFBelowThresholdAndHardInputErrors(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
+	policy := proxyWAFPolicy(t, "enforce", 5, true)
+	route.WAF = &policy
+	handler, err := NewWithPolicies([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), discardLogger())
+	if err != nil {
+		t.Fatalf("NewWithPolicies() error = %v", err)
+	}
+
+	below := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	below.Header.Set("X-HTTP-Method-Override", "TRACE")
+	response := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(response, below)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("below-threshold status = %d", response.Code)
+	}
+
+	for _, tt := range []struct {
+		name, contentType, body, wantCode string
+		wantStatus                        int
+	}{
+		{"malformed JSON", "application/json", "{", "INVALID_REQUEST", http.StatusBadRequest},
+		{"unsupported media", "application/octet-stream", "opaque", "UNSUPPORTED_MEDIA_TYPE", http.StatusUnsupportedMediaType},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/api/users", strings.NewReader(tt.body))
+			request.Header.Set("Content-Type", tt.contentType)
+			response := httptest.NewRecorder()
+			middleware.RequestID(handler).ServeHTTP(response, request)
+			assertJSONError(t, response, tt.wantStatus, tt.wantCode)
+		})
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("hard input error reached upstream; calls = %d", upstreamCalls.Load())
+	}
+}
+
+func TestAuthenticationAndRateLimitPrecedeWAF(t *testing.T) {
+	policy := rateLimitPolicy(t, 1, 1, "deny")
+	wafPolicy := proxyWAFPolicy(t, "enforce", 5, true)
+	inspector := &stubInspector{}
+	limiter := &stubRateLimiter{decision: ratelimit.Decision{Allowed: false, RetryAfter: time.Second}}
+	route := publicRoute(t, "orders", "/api/orders", "http://upstream.invalid", time.Second)
+	route.Auth = protectedPolicy(t, "orders:read")
+	route.RateLimit = &policy
+	route.WAF = &wafPolicy
+	handler, err := NewWithPolicies([]router.Route{route}, registryForCredential(t, proxyTestCredential, []string{"orders:read"}), limiter, inspector, discardLogger())
+	if err != nil {
+		t.Fatalf("NewWithPolicies() error = %v", err)
+	}
+
+	unauthorized := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(unauthorized, httptest.NewRequest(http.MethodPost, "/api/orders", strings.NewReader(strings.Repeat("x", 1000))))
+	assertJSONError(t, unauthorized, http.StatusUnauthorized, "UNAUTHORIZED")
+	if limiter.calls.Load() != 0 || inspector.calls.Load() != 0 {
+		t.Fatal("authentication rejection invoked a later policy")
+	}
+
+	limitedRequest := httptest.NewRequest(http.MethodPost, "/api/orders", strings.NewReader(strings.Repeat("x", 1000)))
+	limitedRequest.Header.Set(auth.HeaderName, proxyTestCredential)
+	limited := httptest.NewRecorder()
+	middleware.RequestID(handler).ServeHTTP(limited, limitedRequest)
+	assertJSONError(t, limited, http.StatusTooManyRequests, "RATE_LIMITED")
+	if inspector.calls.Load() != 0 {
+		t.Fatal("rate-limited request incurred WAF inspection")
+	}
+}
+
+func TestWAFInternalFailurePolicy(t *testing.T) {
+	for _, tt := range []struct {
+		mode string
+		want int
+	}{{"audit", http.StatusBadGateway}, {"enforce", http.StatusServiceUnavailable}} {
+		t.Run(tt.mode, func(t *testing.T) {
+			route := publicRoute(t, "test", "/api", "http://127.0.0.1:0", time.Second)
+			policy := proxyWAFPolicy(t, tt.mode, 5, false)
+			route.WAF = &policy
+			handler, err := NewWithPolicies([]router.Route{route}, emptyRegistry(t), nil, &stubInspector{err: waf.ErrInternal}, discardLogger())
+			if err != nil {
+				t.Fatalf("NewWithPolicies() error = %v", err)
+			}
+			response := httptest.NewRecorder()
+			middleware.RequestID(handler).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api", nil))
+			if response.Code != tt.want {
+				t.Fatalf("status = %d, want %d", response.Code, tt.want)
+			}
+			if tt.mode == "enforce" {
+				assertJSONError(t, response, http.StatusServiceUnavailable, "WAF_UNAVAILABLE")
+			}
+		})
+	}
+}
+
 func upstreamNameHandler(name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, name+":"+r.URL.Path)
@@ -620,6 +802,33 @@ type stubRateLimiter struct {
 	calls    atomic.Int32
 	routeID  string
 	subject  string
+}
+
+type stubInspector struct {
+	result waf.Result
+	err    error
+	calls  atomic.Int32
+}
+
+func (i *stubInspector) Inspect(_ *http.Request, _ waf.Policy) (waf.Result, error) {
+	i.calls.Add(1)
+	return i.result, i.err
+}
+
+func proxyWAFPolicy(t *testing.T, mode string, threshold int, body bool) waf.Policy {
+	t.Helper()
+	inspection := waf.Inspection{Query: true, Headers: true, MaxQueryBytes: 8192, MaxHeaderBytes: 16384}
+	if body {
+		inspection.Body = true
+		inspection.MaxBodyBytes = 256
+		inspection.MaxJSONDepth = 10
+		inspection.MaxJSONElements = 100
+	}
+	policy, err := waf.NewPolicy(mode, waf.RuleSetCoreV1, threshold, inspection)
+	if err != nil {
+		t.Fatalf("waf.NewPolicy() error = %v", err)
+	}
+	return policy
 }
 
 func (l *stubRateLimiter) Allow(_ context.Context, routeID, subject string, _ ratelimit.Policy) (ratelimit.Decision, error) {

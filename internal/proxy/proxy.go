@@ -19,19 +19,25 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
 
 // Handler matches requests and forwards them to the configured upstream.
 type Handler struct {
-	router  *router.Router
-	proxies map[string]http.Handler
-	auth    *auth.Registry
-	limiter RateLimiter
-	logger  *slog.Logger
+	router    *router.Router
+	proxies   map[string]http.Handler
+	auth      *auth.Registry
+	limiter   RateLimiter
+	inspector RequestInspector
+	logger    *slog.Logger
 }
 
 type RateLimiter interface {
 	Allow(context.Context, string, string, ratelimit.Policy) (ratelimit.Decision, error)
+}
+
+type RequestInspector interface {
+	Inspect(*http.Request, waf.Policy) (waf.Result, error)
 }
 
 var errRouteTimeout = errors.New("route timeout exceeded")
@@ -43,12 +49,21 @@ func New(routes []router.Route, registry *auth.Registry, logger *slog.Logger) (*
 
 // NewWithRateLimiter builds a proxy pipeline with optional Redis-backed rate limiting.
 func NewWithRateLimiter(routes []router.Route, registry *auth.Registry, limiter RateLimiter, logger *slog.Logger) (*Handler, error) {
+	return NewWithPolicies(routes, registry, limiter, nil, logger)
+}
+
+// NewWithPolicies builds the complete authentication, rate-limit, inspection,
+// and reverse-proxy pipeline without performing a second route match.
+func NewWithPolicies(routes []router.Route, registry *auth.Registry, limiter RateLimiter, inspector RequestInspector, logger *slog.Logger) (*Handler, error) {
 	if registry == nil {
 		return nil, errors.New("API key registry must not be nil")
 	}
 	for _, route := range routes {
 		if route.RateLimit != nil && limiter == nil {
 			return nil, fmt.Errorf("route %q enables rate limiting but no limiter is configured", route.ID)
+		}
+		if route.WAF != nil && route.WAF.Enabled() && inspector == nil {
+			return nil, fmt.Errorf("route %q enables WAF inspection but no inspector is configured", route.ID)
 		}
 	}
 	routeTable, err := router.New(routes)
@@ -74,7 +89,7 @@ func NewWithRateLimiter(routes []router.Route, registry *auth.Registry, limiter 
 		proxies[route.ID] = reverseProxy(upstream, logger)
 	}
 
-	return &Handler{router: routeTable, proxies: proxies, auth: registry, limiter: limiter, logger: logger}, nil
+	return &Handler{router: routeTable, proxies: proxies, auth: registry, limiter: limiter, inspector: inspector, logger: logger}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -117,10 +132,67 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if route.WAF != nil && route.WAF.Enabled() {
+		result, err := h.inspector.Inspect(r, *route.WAF)
+		if err != nil {
+			var clientError *waf.ClientError
+			action := "allow"
+			if errors.As(err, &clientError) || route.WAF.Enforces() {
+				action = "reject"
+			}
+			h.logWAFEvent(r, route, result, action, wafErrorKind(err))
+			if errors.As(err, &clientError) {
+				writeError(w, clientError.Status, clientError.Code, clientError.Message, middleware.RequestIDFromContext(r.Context()))
+				return
+			}
+			if route.WAF.Enforces() {
+				writeError(w, http.StatusServiceUnavailable, "WAF_UNAVAILABLE", "request inspection service unavailable", middleware.RequestIDFromContext(r.Context()))
+				return
+			}
+		} else if len(result.MatchedRuleIDs) > 0 {
+			h.logWAFEvent(r, route, result, string(result.Action), "rule_match")
+		}
+		if err == nil && result.Action == waf.ActionBlock {
+			writeError(w, http.StatusForbidden, "WAF_BLOCKED", "request rejected by security policy", middleware.RequestIDFromContext(r.Context()))
+			return
+		}
+	}
 
 	ctx, cancel := context.WithTimeoutCause(r.Context(), route.Timeout, errRouteTimeout)
 	defer cancel()
 	h.proxies[route.ID].ServeHTTP(w, r.WithContext(ctx))
+}
+
+func (h *Handler) logWAFEvent(r *http.Request, route router.Route, result waf.Result, action, reason string) {
+	h.logger.WarnContext(r.Context(), "WAF security event",
+		"event_type", "waf_request_inspection",
+		"request_id", middleware.RequestIDFromContext(r.Context()),
+		"route_id", route.ID,
+		"waf_mode", route.WAF.Mode(),
+		"action", action,
+		"reason", reason,
+		"anomaly_score", result.AnomalyScore,
+		"matched_rule_ids", result.MatchedRuleIDs,
+		"highest_severity", result.HighestSeverity,
+		"method", r.Method,
+		"path_class", pathClass(route.PathPrefix, r.URL.Path),
+		"inspection_duration", result.Duration,
+	)
+}
+
+func pathClass(prefix, requestPath string) string {
+	if requestPath == prefix {
+		return "route_root"
+	}
+	return "route_descendant"
+}
+
+func wafErrorKind(err error) string {
+	var clientError *waf.ClientError
+	if errors.As(err, &clientError) {
+		return clientError.Kind
+	}
+	return "internal_failure"
 }
 
 func rateLimitSubject(route router.Route, identity auth.Identity, remoteAddr string) (string, error) {

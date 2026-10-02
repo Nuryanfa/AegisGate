@@ -15,6 +15,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/waf"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -69,6 +70,25 @@ type fileRoute struct {
 	Timeout    string         `yaml:"timeout"`
 	Auth       fileAuth       `yaml:"auth"`
 	RateLimit  *fileRateLimit `yaml:"rate_limit"`
+	WAF        *fileWAF       `yaml:"waf"`
+}
+
+type fileWAF struct {
+	Mode             string          `yaml:"mode"`
+	RuleSet          string          `yaml:"rule_set"`
+	AnomalyThreshold int             `yaml:"anomaly_threshold"`
+	Inspection       *fileInspection `yaml:"inspection"`
+}
+
+type fileInspection struct {
+	Query           bool `yaml:"query"`
+	Headers         bool `yaml:"headers"`
+	Body            bool `yaml:"body"`
+	MaxQueryBytes   *int `yaml:"max_query_bytes"`
+	MaxHeaderBytes  *int `yaml:"max_header_bytes"`
+	MaxBodyBytes    *int `yaml:"max_body_bytes"`
+	MaxJSONDepth    *int `yaml:"max_json_depth"`
+	MaxJSONElements *int `yaml:"max_json_elements"`
 }
 
 type RedisConfig struct {
@@ -305,6 +325,14 @@ func parseRoute(index int, raw fileRoute) (router.Route, error) {
 		}
 		rateLimitPolicy = &parsed
 	}
+	var wafPolicy *waf.Policy
+	if raw.WAF != nil {
+		parsed, err := parseWAF(*raw.WAF)
+		if err != nil {
+			return router.Route{}, fmt.Errorf("%s.waf: %w", label, err)
+		}
+		wafPolicy = &parsed
+	}
 
 	return router.Route{
 		ID:         raw.ID,
@@ -313,7 +341,36 @@ func parseRoute(index int, raw fileRoute) (router.Route, error) {
 		Timeout:    timeout,
 		Auth:       policy,
 		RateLimit:  rateLimitPolicy,
+		WAF:        wafPolicy,
 	}, nil
+}
+
+func parseWAF(raw fileWAF) (waf.Policy, error) {
+	if raw.Mode == string(waf.ModeDisabled) {
+		if raw.RuleSet != "" || raw.AnomalyThreshold != 0 || raw.Inspection != nil {
+			return waf.Policy{}, errors.New("disabled mode must not define rule_set, anomaly_threshold, or inspection")
+		}
+		return waf.NewPolicy(raw.Mode, "", 0, waf.Inspection{})
+	}
+	if raw.Inspection == nil {
+		return waf.Policy{}, errors.New("inspection is required when WAF is enabled")
+	}
+	inspection := waf.Inspection{
+		Query: raw.Inspection.Query, Headers: raw.Inspection.Headers, Body: raw.Inspection.Body,
+		MaxQueryBytes:   valueOrZero(raw.Inspection.MaxQueryBytes),
+		MaxHeaderBytes:  valueOrZero(raw.Inspection.MaxHeaderBytes),
+		MaxBodyBytes:    valueOrZero(raw.Inspection.MaxBodyBytes),
+		MaxJSONDepth:    valueOrZero(raw.Inspection.MaxJSONDepth),
+		MaxJSONElements: valueOrZero(raw.Inspection.MaxJSONElements),
+	}
+	return waf.NewPolicy(raw.Mode, raw.RuleSet, raw.AnomalyThreshold, inspection)
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func parseRedis(raw fileRedis) (RedisConfig, error) {

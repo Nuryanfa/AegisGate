@@ -1,4 +1,4 @@
-.PHONY: run run-upstream run-users run-orders generate-key build test test-integration test-race fmt vet tidy check
+.PHONY: run run-upstream run-users run-orders generate-key build test test-integration test-race test-fuzz bench-waf fmt vet tidy check
 
 run:
 	AEGIS_CONFIG_PATH=configs/config.example.yaml go run ./cmd/gateway
@@ -26,6 +26,14 @@ test-integration:
 
 test-race:
 	go test -race ./...
+
+test-fuzz:
+	go test ./internal/waf -run=^$$ -fuzz=FuzzNormalizeQuery -fuzztime=2s
+	go test ./internal/waf -run=^$$ -fuzz=FuzzInspectJSON -fuzztime=2s
+	go test ./internal/waf -run=^$$ -fuzz=FuzzRuleEvaluation -fuzztime=2s
+
+bench-waf:
+	go test ./internal/waf -run=^$$ -bench=BenchmarkWAF -benchmem -count=1 -benchtime=500ms
 
 fmt:
 	gofmt -w .

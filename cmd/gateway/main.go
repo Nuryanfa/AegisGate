@@ -15,6 +15,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 	"github.com/Nuryanfa/AegisGate/internal/server"
+	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
 
 func main() {
@@ -52,7 +53,7 @@ func main() {
 			}
 		}()
 	}
-	proxyHandler, err := proxy.NewWithRateLimiter(cfg.Routes, registry, limiter, logger)
+	proxyHandler, err := proxy.NewWithPolicies(cfg.Routes, registry, limiter, waf.NewEngine(), logger)
 	if err != nil {
 		logger.Error("build gateway routes", "error", err)
 		os.Exit(1)
@@ -83,11 +84,22 @@ func main() {
 		"route_count", len(cfg.Routes),
 		"api_key_count", len(cfg.APIKeys),
 		"rate_limited_route_count", rateLimitedRouteCount(cfg.Routes),
+		"waf_enabled_route_count", wafEnabledRouteCount(cfg.Routes),
 	)
 	if err := httpServer.Run(ctx, cfg.ShutdownTimeout); err != nil {
 		logger.Error("gateway stopped with an error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func wafEnabledRouteCount(routes []router.Route) int {
+	count := 0
+	for _, route := range routes {
+		if route.WAF != nil && route.WAF.Enabled() {
+			count++
+		}
+	}
+	return count
 }
 
 func hasFailClosedRateLimit(routes []router.Route) bool {

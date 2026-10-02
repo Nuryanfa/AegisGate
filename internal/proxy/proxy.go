@@ -19,6 +19,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/securityevent"
 	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
 
@@ -29,6 +30,7 @@ type Handler struct {
 	auth      *auth.Registry
 	limiter   RateLimiter
 	inspector RequestInspector
+	events    SecurityEventPublisher
 	logger    *slog.Logger
 }
 
@@ -38,6 +40,10 @@ type RateLimiter interface {
 
 type RequestInspector interface {
 	Inspect(*http.Request, waf.Policy) (waf.Result, error)
+}
+
+type SecurityEventPublisher interface {
+	Publish(securityevent.Event) bool
 }
 
 var errRouteTimeout = errors.New("route timeout exceeded")
@@ -55,6 +61,21 @@ func NewWithRateLimiter(routes []router.Route, registry *auth.Registry, limiter 
 // NewWithPolicies builds the complete authentication, rate-limit, inspection,
 // and reverse-proxy pipeline without performing a second route match.
 func NewWithPolicies(routes []router.Route, registry *auth.Registry, limiter RateLimiter, inspector RequestInspector, logger *slog.Logger) (*Handler, error) {
+	return newHandler(routes, registry, limiter, inspector, nil, logger)
+}
+
+// NewWithSecurityEvents builds the production policy pipeline and requires an
+// asynchronous publisher whenever at least one route enables WAF inspection.
+func NewWithSecurityEvents(routes []router.Route, registry *auth.Registry, limiter RateLimiter, inspector RequestInspector, publisher SecurityEventPublisher, logger *slog.Logger) (*Handler, error) {
+	for _, route := range routes {
+		if route.WAF != nil && route.WAF.Enabled() && publisher == nil {
+			return nil, fmt.Errorf("route %q enables WAF inspection but no security-event publisher is configured", route.ID)
+		}
+	}
+	return newHandler(routes, registry, limiter, inspector, publisher, logger)
+}
+
+func newHandler(routes []router.Route, registry *auth.Registry, limiter RateLimiter, inspector RequestInspector, publisher SecurityEventPublisher, logger *slog.Logger) (*Handler, error) {
 	if registry == nil {
 		return nil, errors.New("API key registry must not be nil")
 	}
@@ -89,7 +110,7 @@ func NewWithPolicies(routes []router.Route, registry *auth.Registry, limiter Rat
 		proxies[route.ID] = reverseProxy(upstream, logger)
 	}
 
-	return &Handler{router: routeTable, proxies: proxies, auth: registry, limiter: limiter, inspector: inspector, logger: logger}, nil
+	return &Handler{router: routeTable, proxies: proxies, auth: registry, limiter: limiter, inspector: inspector, events: publisher, logger: logger}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +161,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if errors.As(err, &clientError) || route.WAF.Enforces() {
 				action = "reject"
 			}
-			h.logWAFEvent(r, route, result, action, wafErrorKind(err))
+			h.publishWAFEvent(r, route, result, action, wafErrorKind(err))
 			if errors.As(err, &clientError) {
 				writeError(w, clientError.Status, clientError.Code, clientError.Message, middleware.RequestIDFromContext(r.Context()))
 				return
@@ -150,7 +171,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if len(result.MatchedRuleIDs) > 0 {
-			h.logWAFEvent(r, route, result, string(result.Action), "rule_match")
+			h.publishWAFEvent(r, route, result, string(result.Action), "rule_match")
 		}
 		if err == nil && result.Action == waf.ActionBlock {
 			writeError(w, http.StatusForbidden, "WAF_BLOCKED", "request rejected by security policy", middleware.RequestIDFromContext(r.Context()))
@@ -163,21 +184,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxies[route.ID].ServeHTTP(w, r.WithContext(ctx))
 }
 
-func (h *Handler) logWAFEvent(r *http.Request, route router.Route, result waf.Result, action, reason string) {
-	h.logger.WarnContext(r.Context(), "WAF security event",
-		"event_type", "waf_request_inspection",
-		"request_id", middleware.RequestIDFromContext(r.Context()),
-		"route_id", route.ID,
-		"waf_mode", route.WAF.Mode(),
-		"action", action,
-		"reason", reason,
-		"anomaly_score", result.AnomalyScore,
-		"matched_rule_ids", result.MatchedRuleIDs,
-		"highest_severity", result.HighestSeverity,
-		"method", r.Method,
-		"path_class", pathClass(route.PathPrefix, r.URL.Path),
-		"inspection_duration", result.Duration,
-	)
+func (h *Handler) publishWAFEvent(r *http.Request, route router.Route, result waf.Result, action, reason string) {
+	if h.events == nil {
+		return
+	}
+	h.events.Publish(securityevent.NewEvent(securityevent.EventInput{
+		OccurredAt: time.Now().UTC(), RequestID: middleware.RequestIDFromContext(r.Context()), RouteID: route.ID,
+		WAFMode: string(route.WAF.Mode()), Action: action, ReasonClass: reason,
+		AnomalyScore: result.AnomalyScore, MatchedRuleIDs: result.MatchedRuleIDs,
+		HighestSeverity: string(result.HighestSeverity), Method: r.Method,
+		PathClassification: pathClass(route.PathPrefix, r.URL.Path), InspectionDuration: result.Duration,
+	}))
 }
 
 func pathClass(prefix, requestPath string) string {

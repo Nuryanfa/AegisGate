@@ -1,8 +1,8 @@
 # AegisGate
 
 AegisGate is a portfolio-grade API gateway and security platform written in
-Go. v0.5 adds bounded per-route request inspection and a small auditable WAF
-rule engine to the authenticated, distributed-rate-limited v0.4 gateway.
+Go. v0.6 adds a bounded asynchronous security-event pipeline and deterministic
+process-local burst detection to the v0.5 WAF gateway.
 
 This is an educational, production-like project, not a claim of production
 readiness. An API key identifies a calling application, not a human user.
@@ -18,6 +18,8 @@ readiness. An API key identifies a calling application, not a human user.
 - Explicit per-route fail-open or fail-closed Redis behavior
 - Per-route WAF `disabled`, `audit`, and `enforce` modes with anomaly scoring
 - Bounded query, header, JSON, form, and plain-text inspection
+- Non-blocking, bounded security-event publication with fixed sink workers
+- Process-local `AG-D2001` rule-activity and `AG-D2002` block-activity detection
 - JSON `400`, `401`, `403`, `404`, `413`, `414`, `415`, `429`, `502`, `503`, and
   `504` errors
 - Request IDs, structured logs, forwarding-header sanitization, health checks,
@@ -51,6 +53,21 @@ redis:
   connect_timeout: 2s
   command_timeout: 500ms
   pool_size: 20
+
+security_events:
+  queue_capacity: 1024
+  delivery_capacity: 1024
+  workers: 2
+  sink_timeout: 1s
+  shutdown_timeout: 5s
+  summary_interval: 30s
+  detection:
+    enabled: true
+    window: 30s
+    rule_match_threshold: 10
+    block_threshold: 10
+    cooldown: 1m
+    max_keys: 4096
 
 api_keys:
   - id: orders-client
@@ -138,7 +155,7 @@ containing only fail-open policies remains ready during that outage.
 
 `waf` is optional per route; omission means no inspection. Explicit
 `mode: disabled` takes no rule set, threshold, inspection flags, or unused
-limits. `audit` evaluates `core-v1`, logs one bounded security event when a
+limits. `audit` evaluates `core-v1`, publishes one bounded security event when a
 rule matches, and forwards the request. `enforce` returns JSON `403` with code
 `WAF_BLOCKED` when the summed score reaches `anomaly_threshold`. Thresholds
 must be 1–100. Unknown fields, modes, and rule sets fail startup.
@@ -169,6 +186,39 @@ It does not join separate request fields or repeatedly decode values. See
 [`ADR 0003`](docs/adr/0003-bounded-request-inspection.md) for the exact
 normalization, scoring, failure, privacy, and limitation contract.
 
+### Asynchronous security events and detection
+
+When at least one route enables WAF inspection, AegisGate starts an in-memory
+pipeline. The request path constructs an immutable bounded event and performs
+a non-blocking publish to a bounded ingress queue. One detector goroutine owns
+all correlation state, and a fixed worker pool writes raw events and generated
+alerts to the structured `slog` sink through per-write timeouts. WAF parsing,
+scoring, audit/enforce selection, and rejection remain synchronous.
+
+Delivery is deliberately **best effort**: the pipeline is process-local,
+non-durable, and able to drop the newest event when saturated or closing.
+Delivery success never controls an HTTP decision. It is not a SIEM, message
+broker, persistent audit log, or cross-instance correlation system. Periodic
+and final summaries expose accepted, dropped, processed, alert, sink-error,
+delivery, queue-depth, and active-key statistics. v0.6 adds no public metrics
+endpoint.
+
+`AG-D2001` counts each stable WAF rule ID independently by route. `AG-D2002`
+counts block decisions by route. Both use fixed windows, exact thresholds,
+cooldown suppression, server-generated time, and a shared `max_keys` bound.
+At that bound, existing keys continue while new keys are dropped and counted.
+Detection resets on process restart.
+
+`security_events` is optional when WAF is enabled; omission selects the values
+shown above. An explicit block must be complete. Unknown, zero, negative,
+excessive, contradictory, or unused settings fail startup. Maximums are 65,536
+entries per queue, 64 workers, 10 seconds per sink write, 30 seconds for
+pipeline shutdown, one hour for summaries/windows, 24 hours for cooldown,
+1,000,000 for thresholds, and 65,536 active detector keys. The block is
+rejected when no route enables WAF. Settings are startup-only and have no
+environment-variable duplicates. See
+[`ADR 0004`](docs/adr/0004-asynchronous-security-event-pipeline.md).
+
 ### Routing and timeouts
 
 `/api/users` matches itself and `/api/users/42`, not `/api/users-v2`; the
@@ -197,12 +247,14 @@ Committed example digests are deliberately non-working placeholders. Copy
 `configs/config.example.yaml` to the gitignored `configs/local.yaml`, generate
 two keys, and grant `orders:read` to only one to run the full demo.
 
-### Migrate from v0.4
+### Migrate from v0.5
 
-Existing v0.4 files remain valid and have no WAF inspection. Add a complete
-per-route `waf` block to opt in. Roll out `disabled -> audit -> review false
-positives -> tune threshold or route policy -> enforce`. Restart all gateways
-after changing policy; configuration is still startup-only.
+Existing v0.5 files remain valid. If any route enables WAF and
+`security_events` is omitted, v0.6 starts the pipeline with conservative
+defaults. Add the complete block above only to tune it. Log consumers must no
+longer assume WAF events are emitted synchronously or in request-completion
+order. Raw events use `aegis.security_event.v1`; alerts use
+`aegis.security_alert.v1`. Restart all gateways after configuration changes.
 
 ## Run locally
 
@@ -299,12 +351,14 @@ Both return `503`; `/healthz` remains `200`. Change a route explicitly to
 `on_redis_error: allow` to demonstrate forwarding during the outage.
 
 The committed Docker configuration runs `users` in WAF audit mode and `orders`
-in enforce mode. A benign users request and a representative audit match both
-reach the users upstream; the match produces a metadata-only gateway event:
+in enforce mode. Its demonstration-only detector threshold is three. A benign
+users request and repeated audit matches all reach the upstream; logs contain
+asynchronous raw events followed by an `AG-D2001` alert:
 
 ```powershell
 curl.exe -i "http://localhost:8080/api/users/42?q=hello"
-curl.exe -i "http://localhost:8080/api/users/42?q=1%27%20OR%201%3D1--"
+1..3 | ForEach-Object { curl.exe -i "http://localhost:8080/api/users/42?q=1%27%20OR%201%3D1--" }
+docker compose logs gateway | Select-String "aegis.security_event.v1|AG-D2001"
 ```
 
 After placing a valid digest in a gitignored Docker configuration, the
@@ -312,6 +366,14 @@ equivalent protected orders request is blocked before its upstream:
 
 ```powershell
 curl.exe -i -H "X-API-Key: $env:ORDERS_API_KEY" "http://localhost:8080/api/orders/42?q=1%27%20OR%201%3D1--"
+```
+
+Repeat that protected request three times to observe `AG-D2002`; every response
+remains `403`. Stop the gateway gracefully and inspect its final counters:
+
+```powershell
+docker compose stop gateway
+docker compose logs gateway | Select-String "security-event pipeline stopped"
 ```
 
 ## Security model
@@ -339,6 +401,8 @@ contextual output encoding, allowlist validation, safe process execution,
 filesystem authorization, and resource-level authorization. Security events
 never include API keys, authorization/cookie values, query strings, bodies,
 raw evidence, arbitrary header values, client identity, or peer address.
+They also exclude upstream or Redis credentials, internal error strings, and
+stack traces.
 
 ## Checks
 
@@ -357,9 +421,12 @@ go test -count=1 -v ./internal/ratelimit
 ```
 
 Make targets include `generate-key`, `fmt`, `tidy`, `check`, `test-race`,
-`test-fuzz`, `bench-waf`, and `build`. The measured v0.5 WAF microbenchmark,
+`test-fuzz`, `bench-waf`, `bench-security-events`, and `build`. The measured
+v0.5 WAF microbenchmark,
 including environment and inputs, is recorded in
-[`docs/benchmarks/v0.5-waf.md`](docs/benchmarks/v0.5-waf.md).
+[`docs/benchmarks/v0.5-waf.md`](docs/benchmarks/v0.5-waf.md); v0.6 pipeline
+microbenchmarks are in
+[`docs/benchmarks/v0.6-security-events.md`](docs/benchmarks/v0.6-security-events.md).
 
 ## Workflow and roadmap
 
@@ -372,8 +439,10 @@ start from `develop`. Promote milestones only after validation and review.
 | v0.2 | Configurable routing and timeouts | Implemented |
 | v0.3 | API-client authentication and route authorization | Implemented |
 | v0.4 | Redis-backed distributed rate limiting | Released (`v0.4.0`) |
-| v0.5 | Bounded request inspection and WAF rules | Implemented on feature branch |
-| v0.6–v0.8 | Detection, observability, distributed deployment | Planned |
+| v0.5 | Bounded request inspection and WAF rules | Released (`v0.5.0`) |
+| v0.6 | Asynchronous security events and process-local detection | Implemented on feature branch |
+| v0.7 | Metrics, tracing, and operational observability | Planned |
+| v0.8 | gRPC control plane and distributed configuration | Planned |
 
 ## License
 

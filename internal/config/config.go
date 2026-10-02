@@ -15,6 +15,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/securityevent"
 	"github.com/Nuryanfa/AegisGate/internal/waf"
 	"go.yaml.in/yaml/v3"
 )
@@ -43,15 +44,36 @@ type Config struct {
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
 	Redis           *RedisConfig
+	SecurityEvents  *securityevent.Options
 	APIKeys         []auth.Key
 	Routes          []router.Route
 }
 
 type fileConfig struct {
-	Server  fileServer   `yaml:"server"`
-	Redis   *fileRedis   `yaml:"redis"`
-	APIKeys []fileAPIKey `yaml:"api_keys"`
-	Routes  []fileRoute  `yaml:"routes"`
+	Server         fileServer          `yaml:"server"`
+	Redis          *fileRedis          `yaml:"redis"`
+	SecurityEvents *fileSecurityEvents `yaml:"security_events"`
+	APIKeys        []fileAPIKey        `yaml:"api_keys"`
+	Routes         []fileRoute         `yaml:"routes"`
+}
+
+type fileSecurityEvents struct {
+	QueueCapacity    int            `yaml:"queue_capacity"`
+	DeliveryCapacity int            `yaml:"delivery_capacity"`
+	Workers          int            `yaml:"workers"`
+	SinkTimeout      string         `yaml:"sink_timeout"`
+	ShutdownTimeout  string         `yaml:"shutdown_timeout"`
+	SummaryInterval  string         `yaml:"summary_interval"`
+	Detection        *fileDetection `yaml:"detection"`
+}
+
+type fileDetection struct {
+	Enabled            *bool  `yaml:"enabled"`
+	Window             string `yaml:"window"`
+	RuleMatchThreshold int    `yaml:"rule_match_threshold"`
+	BlockThreshold     int    `yaml:"block_threshold"`
+	Cooldown           string `yaml:"cooldown"`
+	MaxKeys            int    `yaml:"max_keys"`
 }
 
 type fileServer struct {
@@ -279,8 +301,87 @@ func build(raw fileConfig) (Config, error) {
 	if !hasRateLimit && cfg.Redis != nil {
 		return Config{}, errors.New("redis configuration is unused because no route enables rate limiting")
 	}
+	hasWAF := false
+	for _, route := range cfg.Routes {
+		if route.WAF != nil && route.WAF.Enabled() {
+			hasWAF = true
+			break
+		}
+	}
+	if hasWAF {
+		options := securityevent.DefaultOptions()
+		if raw.SecurityEvents != nil {
+			parsed, err := parseSecurityEvents(*raw.SecurityEvents)
+			if err != nil {
+				return Config{}, err
+			}
+			options = parsed
+		}
+		cfg.SecurityEvents = &options
+	} else if raw.SecurityEvents != nil {
+		return Config{}, errors.New("security_events configuration is unused because no route enables WAF inspection")
+	}
 
 	return cfg, nil
+}
+
+func parseSecurityEvents(raw fileSecurityEvents) (securityevent.Options, error) {
+	if raw.Detection == nil {
+		return securityevent.Options{}, errors.New("security_events.detection is required")
+	}
+	sinkTimeout, err := requiredDuration("security_events.sink_timeout", raw.SinkTimeout)
+	if err != nil {
+		return securityevent.Options{}, err
+	}
+	shutdownTimeout, err := requiredDuration("security_events.shutdown_timeout", raw.ShutdownTimeout)
+	if err != nil {
+		return securityevent.Options{}, err
+	}
+	summaryInterval, err := requiredDuration("security_events.summary_interval", raw.SummaryInterval)
+	if err != nil {
+		return securityevent.Options{}, err
+	}
+	detection, err := parseDetection(*raw.Detection)
+	if err != nil {
+		return securityevent.Options{}, err
+	}
+	options := securityevent.Options{
+		QueueCapacity: raw.QueueCapacity, DeliveryCapacity: raw.DeliveryCapacity, Workers: raw.Workers,
+		SinkTimeout: sinkTimeout, ShutdownTimeout: shutdownTimeout, SummaryInterval: summaryInterval,
+		Detection: detection,
+	}
+	if err := options.Validate(); err != nil {
+		return securityevent.Options{}, err
+	}
+	return options, nil
+}
+
+func parseDetection(raw fileDetection) (securityevent.DetectionOptions, error) {
+	if raw.Enabled == nil {
+		return securityevent.DetectionOptions{}, errors.New("security_events.detection.enabled is required")
+	}
+	if !*raw.Enabled {
+		options := securityevent.DetectionOptions{Enabled: false}
+		if raw.Window != "" || raw.RuleMatchThreshold != 0 || raw.BlockThreshold != 0 || raw.Cooldown != "" || raw.MaxKeys != 0 {
+			return options, errors.New("disabled security-event detection must not define unused settings")
+		}
+		return options, nil
+	}
+	window, err := requiredDuration("security_events.detection.window", raw.Window)
+	if err != nil {
+		return securityevent.DetectionOptions{}, err
+	}
+	cooldown, err := requiredDuration("security_events.detection.cooldown", raw.Cooldown)
+	if err != nil {
+		return securityevent.DetectionOptions{}, err
+	}
+	options := securityevent.DetectionOptions{Enabled: true, Window: window,
+		RuleMatchThreshold: raw.RuleMatchThreshold, BlockThreshold: raw.BlockThreshold,
+		Cooldown: cooldown, MaxKeys: raw.MaxKeys}
+	if err := options.Validate(); err != nil {
+		return securityevent.DetectionOptions{}, err
+	}
+	return options, nil
 }
 
 func parseRoute(index int, raw fileRoute) (router.Route, error) {

@@ -13,6 +13,23 @@ redis:
   command_timeout: 500ms
   pool_size: 20
 
+# Optional while at least one route enables WAF. If omitted, the gateway uses
+# these conservative defaults. The pipeline is in-memory and best effort.
+security_events:
+  queue_capacity: 1024
+  delivery_capacity: 1024
+  workers: 2
+  sink_timeout: 1s
+  shutdown_timeout: 5s
+  summary_interval: 30s
+  detection:
+    enabled: true
+    window: 30s
+    rule_match_threshold: 10
+    block_threshold: 10
+    cooldown: 1m
+    max_keys: 4096
+
 # These digests are deliberately non-working placeholders. Generate real keys
 # with `go run ./cmd/keygen`, keep the plaintext secret outside this repository,
 # and copy only the printed SHA-256 digest into a gitignored local config.

@@ -13,6 +13,23 @@ redis:
   command_timeout: 500ms
   pool_size: 20
 
+# Deliberately low detector thresholds make the local demo observable. Keep
+# the more conservative defaults from config.example.yaml in real deployments.
+security_events:
+  queue_capacity: 1024
+  delivery_capacity: 1024
+  workers: 2
+  sink_timeout: 1s
+  shutdown_timeout: 5s
+  summary_interval: 10s
+  detection:
+    enabled: true
+    window: 30s
+    rule_match_threshold: 3
+    block_threshold: 3
+    cooldown: 1m
+    max_keys: 4096
+
 # Non-working placeholders; use a gitignored local config for real demo keys.
 api_keys:
   - id: orders-client

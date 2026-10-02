@@ -1,6 +1,6 @@
 # AegisGate Project Memory
 
-Last updated: 2026-09-29
+Last updated: 2026-10-02
 
 This file is the durable working memory for the repository. It summarizes the
 current understanding of `PRD.md`; it does not silently turn proposals into
@@ -50,6 +50,8 @@ components, a non-root distroless container, Docker Compose, and GitHub Actions
 CI. Its single environment-configured route was replaced by v0.2, v0.3 added
 API-client access control, and v0.4 adds Redis-backed distributed rate
 limiting. v0.5 adds bounded request inspection and a small WAF rule foundation.
+v0.6 replaces synchronous WAF-event logging with a bounded asynchronous
+pipeline and adds deterministic process-local burst detection.
 
 ## Confirmed v0.2 routing foundation
 
@@ -127,7 +129,7 @@ limiting. v0.5 adds bounded request inspection and a small WAF rule foundation.
 - JSON, URL-encoded form, and plain text are the only inspected body types.
   Non-empty bodies without a supported type, multipart bodies, and compressed
   bodies are rejected. Exact buffered bytes are restored before proxying.
-- Audit matches are logged and forwarded; enforce matches at threshold return
+- Audit matches are published and forwarded; enforce matches at threshold return
   `403`. Hard input/limit errors remain `400`, `413`, or `415`. Unexpected
   internal errors fail closed in enforce and fail open with a safe warning in
   audit.
@@ -135,6 +137,32 @@ limiting. v0.5 adds bounded request inspection and a small WAF rule foundation.
   strings, arbitrary headers, raw evidence, client identity, or peer address.
 - The threat model and normalization contract are recorded in ADR 0003. This
   milestone makes no enterprise-WAF, complete prevention, IDS, or DDoS claim.
+
+## Confirmed v0.6 asynchronous security-event foundation
+
+- WAF enforcement remains synchronous. Only event correlation and delivery are
+  asynchronous, and their success never changes an HTTP decision.
+- The request path publishes immutable bounded metadata without waiting for
+  capacity. A lifecycle read/write lock makes concurrent publish and channel
+  closure safe. Full or closing ingress uses drop-newest and increments a
+  counter.
+- A single detector goroutine owns bounded fixed-window state. `AG-D2001`
+  counts stable rule IDs per route and `AG-D2002` counts blocks per route.
+  Cooldowns limit alert storms; at `max_keys`, expired entries are reclaimed
+  and otherwise new keys are dropped while existing keys continue.
+- Detector output enters a second bounded queue. A fixed worker pool invokes a
+  narrow sink with per-write timeouts. Failures are counted and do not stop
+  workers; v0.6 has no retry or external broker.
+- The structured-log sink uses an explicit allowlist. Events and alerts contain
+  no credentials, payloads, query strings, raw evidence, arbitrary headers,
+  identities, addresses, internal errors, or request-owned objects.
+- Shutdown occurs only after HTTP drain, then closes publication, drains the
+  detector and workers within a separate deadline, cancels outstanding sink
+  calls on timeout, and emits final internal statistics.
+- The pipeline is best effort, in-memory, process-local, non-durable, and may
+  lose events under saturation, shutdown timeout, process failure, or sink
+  failure. It is not a SIEM or cross-instance detector. ADR 0004 records this
+  architecture and its rejected alternatives.
 
 ## Critical engineering observations
 
@@ -226,3 +254,7 @@ These must be confirmed before repository scaffolding hardens them:
 - 2026-09-29: Synchronized `develop` with released tag `v0.4.0` and started
   v0.5 on `feature/v0.5-bounded-waf`. Added bounded per-route inspection,
   audit/enforce scoring, privacy-safe events, and ADR 0003.
+- 2026-10-02: Started v0.6 from released `v0.5.0` on
+  `feature/v0.6-security-event-pipeline`. Selected bounded drop-newest ingress,
+  a single-owner detector, bounded delivery with fixed workers, and a timed
+  allowlisted slog sink; recorded the decision in ADR 0004.

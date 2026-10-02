@@ -1,8 +1,8 @@
 # AegisGate
 
 AegisGate is a portfolio-grade API gateway and security platform written in
-Go. v0.6 adds a bounded asynchronous security-event pipeline and deterministic
-process-local burst detection to the v0.5 WAF gateway.
+Go. v0.7 adds Prometheus metrics and OpenTelemetry tracing to the v0.6
+security-event gateway on the feature branch.
 
 This is an educational, production-like project, not a claim of production
 readiness. An API key identifies a calling application, not a human user.
@@ -20,6 +20,8 @@ readiness. An API key identifies a calling application, not a human user.
 - Bounded query, header, JSON, form, and plain-text inspection
 - Non-blocking, bounded security-event publication with fixed sink workers
 - Process-local `AG-D2001` rule-activity and `AG-D2002` block-activity detection
+- Private Prometheus registry on a dedicated telemetry listener; OTel tracing
+  with bounded OTLP HTTP export and W3C context propagation
 - JSON `400`, `401`, `403`, `404`, `413`, `414`, `415`, `429`, `502`, `503`, and
   `504` errors
 - Request IDs, structured logs, forwarding-header sanitization, health checks,
@@ -42,6 +44,8 @@ Supported overrides are `AEGIS_ENV`, `AEGIS_HTTP_ADDR`,
 `AEGIS_SHUTDOWN_TIMEOUT`. Redis ACL credentials, when needed, come only from
 `AEGIS_REDIS_USERNAME` and `AEGIS_REDIS_PASSWORD`. They are never stored in
 committed YAML. Removed v0.1 variable `AEGIS_UPSTREAM_URL` is rejected.
+The optional `observability` block is file-only; when omitted, metrics and
+tracing are disabled. See [configuration and operations](docs/observability.md).
 
 ```yaml
 server:
@@ -200,8 +204,8 @@ non-durable, and able to drop the newest event when saturated or closing.
 Delivery success never controls an HTTP decision. It is not a SIEM, message
 broker, persistent audit log, or cross-instance correlation system. Periodic
 and final summaries expose accepted, dropped, processed, alert, sink-error,
-delivery, queue-depth, and active-key statistics. v0.6 adds no public metrics
-endpoint.
+delivery, queue-depth, and active-key statistics. v0.7 exposes the same
+snapshot through the private telemetry listener, not the public gateway.
 
 `AG-D2001` counts each stable WAF rule ID independently by route. `AG-D2002`
 counts block decisions by route. Both use fixed windows, exact thresholds,
@@ -413,6 +417,8 @@ go test ./...
 go test -race ./...
 go vet ./...
 go build ./...
+docker compose config
+docker compose --profile observability config
 ```
 
 Real Redis script tests require `AEGIS_REDIS_INTEGRATION_ADDR`, for example:
@@ -429,6 +435,34 @@ including environment and inputs, is recorded in
 [`docs/benchmarks/v0.5-waf.md`](docs/benchmarks/v0.5-waf.md); v0.6 pipeline
 microbenchmarks are in
 [`docs/benchmarks/v0.6-security-events.md`](docs/benchmarks/v0.6-security-events.md).
+The v0.7 instrumentation results and limitations are in
+[`docs/benchmarks/v0.7-observability.md`](docs/benchmarks/v0.7-observability.md).
+
+## Observability demo
+
+```bash
+docker compose --profile observability up --build
+```
+
+If host port 8080 is occupied, set `AEGIS_GATEWAY_PORT=18080` before starting
+Compose and use `http://localhost:18080` for gateway requests.
+
+The Docker configuration enables the metrics listener on the internal Compose
+network (`gateway:9090/metrics`) without publishing it. Prometheus is at
+`http://127.0.0.1:9091`, Jaeger at `http://127.0.0.1:16686`, and the provisioned
+Grafana dashboard at `http://127.0.0.1:3000`. For a local binary, the example
+config binds metrics to `127.0.0.1:9090`; point tracing at an OTLP HTTP
+Collector origin and choose a sampling ratio. The Compose stack is a local
+demonstration, not hardened or durable production telemetry.
+
+Metric labels are limited to validated route IDs and fixed enums; never add
+raw paths, credentials, client identities, IP addresses, request/trace IDs, or
+error strings. Traces exclude bodies, query strings, and WAF evidence and do
+not forward arbitrary baggage. Existing v0.6 access logs still include path
+and direct peer address; protect log retention accordingly. Exporter outages
+do not affect HTTP authorization or readiness, but buffered spans can be lost.
+See [operations](docs/observability.md), [illustrative SLIs/SLOs](docs/observability/slis-slos.md),
+and [ADR 0005](docs/adr/0005-operational-observability.md).
 
 ## Workflow and roadmap
 
@@ -442,8 +476,8 @@ start from `develop`. Promote milestones only after validation and review.
 | v0.3 | API-client authentication and route authorization | Implemented |
 | v0.4 | Redis-backed distributed rate limiting | Released (`v0.4.0`) |
 | v0.5 | Bounded request inspection and WAF rules | Released (`v0.5.0`) |
-| v0.6 | Asynchronous security events and process-local detection | Implemented on feature branch |
-| v0.7 | Metrics, tracing, and operational observability | Planned |
+| v0.6 | Asynchronous security events and process-local detection | Released (`v0.6.0`) |
+| v0.7 | Metrics, tracing, and operational observability | Implemented on `feature/v0.7-observability`, pending review |
 | v0.8 | gRPC control plane and distributed configuration | Planned |
 
 ## License

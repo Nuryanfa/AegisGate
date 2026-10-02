@@ -11,7 +11,7 @@ services:
     volumes:
       - ${AEGIS_CONFIG_FILE:-./configs/config.docker.yaml}:/etc/aegisgate/config.yaml:ro
     ports:
-      - "8080:8080"
+      - "${AEGIS_GATEWAY_PORT:-8080}:8080"
     depends_on:
       users-upstream:
         condition: service_started
@@ -80,3 +80,45 @@ services:
       interval: 2s
       timeout: 1s
       retries: 15
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.13.3
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./deployments/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deployments/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9091:9090"
+    depends_on:
+      - gateway
+
+  otel-collector:
+    profiles: ["observability"]
+    image: otel/opentelemetry-collector:0.162.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./deployments/observability/collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    profiles: ["observability"]
+    image: jaegertracing/jaeger:2.21.0
+    ports:
+      - "127.0.0.1:16686:16686"
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:12.3.1
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deployments/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deployments/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus

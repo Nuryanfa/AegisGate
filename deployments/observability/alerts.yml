@@ -1,0 +1,33 @@
+groups:
+  - name: aegisgate-example
+    rules:
+      - alert: AegisGateHigh5xxRate
+        expr: sum(rate(aegisgate_http_requests_total{status_class="5xx"}[5m])) / clamp_min(sum(rate(aegisgate_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        annotations:
+          summary: "Gateway 5xx exceeds 5% of requests"
+          description: "Availability failures are elevated; policy rejections are excluded."
+      - alert: AegisGateUpstreamFailures
+        expr: sum(rate(aegisgate_upstream_requests_total{result=~"error|timeout"}[5m])) / clamp_min(sum(rate(aegisgate_upstream_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        annotations:
+          summary: "Upstream failures exceed 5% of upstream requests"
+          description: "Investigate upstream errors and timeouts by route."
+      - alert: AegisGateSecurityEventDrops
+        expr: increase(aegisgate_security_event_ingress_drops_total[5m]) + increase(aegisgate_security_event_delivery_drops_total[5m]) > 0
+        for: 5m
+        annotations:
+          summary: "Security events have been dropped"
+          description: "The bounded ingress or delivery queue lost records."
+      - alert: AegisGateSecurityEventSinkErrors
+        expr: increase(aegisgate_security_event_sink_errors_total[5m]) > 0
+        for: 5m
+        annotations:
+          summary: "Security-event sink writes are failing"
+          description: "Inspect gateway logs and sink availability."
+      - alert: AegisGateSecurityEventQueuesHigh
+        expr: aegisgate_security_event_ingress_queue_depth / 1024 > 0.8 or aegisgate_security_event_delivery_queue_depth / 1024 > 0.8
+        for: 10m
+        annotations:
+          summary: "Security-event queue utilization above 80%"
+          description: "Example assumes the Compose queue capacities of 1024; adjust for your configuration."

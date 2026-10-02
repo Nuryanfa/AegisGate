@@ -1,0 +1,22 @@
+{
+  "uid": "aegisgate-operations",
+  "title": "AegisGate Operations",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Request rate by route", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}, "targets": [{"expr": "sum by (route_id) (rate(aegisgate_http_requests_total[5m]))", "legendFormat": "{{route_id}}"}]},
+    {"id": 2, "type": "timeseries", "title": "Gateway 5xx rate", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}, "targets": [{"expr": "sum(rate(aegisgate_http_requests_total{status_class=\"5xx\"}[5m])) / clamp_min(sum(rate(aegisgate_http_requests_total[5m])), 0.001) or vector(0)", "legendFormat": "5xx ratio"}]},
+    {"id": 3, "type": "timeseries", "title": "Latency p50 / p95 / p99", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}, "targets": [{"expr": "histogram_quantile(0.50, sum by (le) (rate(aegisgate_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50"}, {"expr": "histogram_quantile(0.95, sum by (le) (rate(aegisgate_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95"}, {"expr": "histogram_quantile(0.99, sum by (le) (rate(aegisgate_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99"}]},
+    {"id": 4, "type": "timeseries", "title": "Active requests", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}, "targets": [{"expr": "aegisgate_http_requests_in_flight", "legendFormat": "in flight"}]},
+    {"id": 5, "type": "timeseries", "title": "Upstream failures", "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8}, "targets": [{"expr": "sum by (route_id, result) (rate(aegisgate_upstream_requests_total{result=~\"error|timeout\"}[5m])) or vector(0)", "legendFormat": "{{route_id}} {{result}}"}]},
+    {"id": 6, "type": "timeseries", "title": "Auth and authorization rejections", "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8}, "targets": [{"expr": "sum by (route_id, decision) (rate(aegisgate_auth_decisions_total{decision=~\"unauthorized|forbidden\"}[5m]))", "legendFormat": "{{route_id}} {{decision}}"}]},
+    {"id": 7, "type": "timeseries", "title": "Rate-limit rejections", "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8}, "targets": [{"expr": "sum by (route_id, decision) (rate(aegisgate_rate_limit_decisions_total{decision=~\"deny|dependency_deny\"}[5m])) or vector(0)", "legendFormat": "{{route_id}} {{decision}}"}]},
+    {"id": 8, "type": "timeseries", "title": "WAF audits and blocks", "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8}, "targets": [{"expr": "sum by (route_id, action) (rate(aegisgate_waf_decisions_total{action=~\"audit|block\"}[5m]))", "legendFormat": "{{route_id}} {{action}}"}]},
+    {"id": 9, "type": "timeseries", "title": "Security-event drops", "gridPos": {"x": 0, "y": 32, "w": 12, "h": 8}, "targets": [{"expr": "rate(aegisgate_security_event_ingress_drops_total[5m])", "legendFormat": "ingress"}, {"expr": "rate(aegisgate_security_event_delivery_drops_total[5m])", "legendFormat": "delivery"}]},
+    {"id": 10, "type": "timeseries", "title": "Security-event sink errors", "gridPos": {"x": 12, "y": 32, "w": 12, "h": 8}, "targets": [{"expr": "rate(aegisgate_security_event_sink_errors_total[5m])", "legendFormat": "sink errors"}]},
+    {"id": 11, "type": "timeseries", "title": "Security-event queue depth", "gridPos": {"x": 0, "y": 40, "w": 12, "h": 8}, "targets": [{"expr": "aegisgate_security_event_ingress_queue_depth", "legendFormat": "ingress"}, {"expr": "aegisgate_security_event_delivery_queue_depth", "legendFormat": "delivery"}]},
+    {"id": 12, "type": "timeseries", "title": "Active detection-state keys", "gridPos": {"x": 12, "y": 40, "w": 12, "h": 8}, "targets": [{"expr": "aegisgate_security_event_active_detection_keys", "legendFormat": "keys"}]}
+  ]
+}

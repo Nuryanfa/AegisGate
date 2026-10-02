@@ -1,10 +1,13 @@
 package securityevent
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -221,8 +224,16 @@ func TestPipelineShutdownTimeoutCancelsSinkAndIsIdempotent(t *testing.T) {
 	sink := &recordingSink{block: never, started: make(chan struct{})}
 	options := testOptions()
 	options.SinkTimeout = time.Second
-	p := newTestPipeline(t, options, sink)
-	p.Publish(detectorEvent("users", "audit"))
+	var logs bytes.Buffer
+	p, err := NewPipeline(options, sink, slog.New(slog.NewTextHandler(&logs, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 8 {
+		if !p.Publish(detectorEvent("users", "audit")) {
+			t.Fatal("event was dropped before shutdown")
+		}
+	}
 	select {
 	case <-sink.started:
 	case <-time.After(time.Second):
@@ -233,10 +244,74 @@ func TestPipelineShutdownTimeoutCancelsSinkAndIsIdempotent(t *testing.T) {
 	if err := p.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Shutdown() error = %v", err)
 	}
-	shutdownPipeline(t, p, time.Second)
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline goroutines remained active after cancellation")
+	}
+	snapshot := p.Snapshot()
+	if snapshot.SinkErrorsTotal != 1 || snapshot.DroppedDeliveryTotal == 0 || snapshot.DeliveredTotal != 0 {
+		t.Fatalf("unstable final counters: %#v", snapshot)
+	}
+	if !strings.Contains(logs.String(), "security-event pipeline stopped") ||
+		!strings.Contains(logs.String(), fmt.Sprintf("dropped_delivery_total=%d", snapshot.DroppedDeliveryTotal)) {
+		t.Fatalf("final summary did not include settled counters: %s", logs.String())
+	}
+	if after := p.Snapshot(); after != snapshot {
+		t.Fatalf("counters changed after final summary: before=%#v after=%#v", snapshot, after)
+	}
 
 	empty := newTestPipeline(t, testOptions(), &recordingSink{})
 	shutdownPipeline(t, empty, time.Second)
+}
+
+func TestPipelineTimeoutDoesNotClaimStoppedBeforeWorkersExit(t *testing.T) {
+	sink := &uncooperativeSink{started: make(chan struct{}), release: make(chan struct{})}
+	var logs bytes.Buffer
+	p, err := NewPipeline(testOptions(), sink, slog.New(slog.NewTextHandler(&logs, nil)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Publish(detectorEvent("users", "audit"))
+	select {
+	case <-sink.started:
+	case <-time.After(time.Second):
+		t.Fatal("sink did not start")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.Shutdown(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	select {
+	case <-p.done:
+		t.Fatal("pipeline reported completion while sink was still blocked")
+	default:
+	}
+	if strings.Contains(logs.String(), "security-event pipeline stopped") ||
+		!strings.Contains(logs.String(), "security-event pipeline shutdown cancellation requested") {
+		t.Fatalf("incorrect timeout diagnostic: %s", logs.String())
+	}
+	close(sink.release)
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline did not finalize after sink exited")
+	}
+	if !strings.Contains(logs.String(), "security-event pipeline stopped") {
+		t.Fatalf("missing final summary after worker exit: %s", logs.String())
+	}
+}
+
+type uncooperativeSink struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *uncooperativeSink) Write(_ context.Context, _ Record) error {
+	close(s.started)
+	<-s.release
+	return context.Canceled
 }
 
 func testOptions() Options {

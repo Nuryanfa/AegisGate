@@ -69,8 +69,10 @@ no mutex:
   matched rule separately.
 - `AG-D2002` uses route ID keys for WAF actions classified as `block`.
 
-Both detectors use fixed windows, exact threshold crossings, server-generated
-time, and cooldown suppression. State is capped by one shared `max_keys` value.
+Both detectors use fixed windows, server-generated time, and cooldown
+suppression. Each key emits at most one alert per window, only when its count
+first reaches the threshold. If that crossing occurs during cooldown, that
+window emits no later alert. State is capped by one shared `max_keys` value.
 When full, expired state is removed first; if capacity is still unavailable,
 the new key is discarded while existing keys continue. That deterministic
 drop-new-key policy is counted. Detection is process-local, resets on restart,
@@ -116,8 +118,13 @@ Shutdown ordering is:
 5. The pipeline emits final counters.
 
 If the configured pipeline deadline expires, its root context cancels sink
-contexts and remaining work is abandoned and counted where practical. Shutdown
-is idempotent and cannot wait indefinitely for a compliant sink.
+contexts and gives workers a bounded 250 ms grace period to exit. If work still
+remains, `Shutdown` returns with a distinct cancellation-requested diagnostic;
+it does not claim the pipeline has stopped. The final summary is emitted by the
+pipeline coordinator only after every stage exits and remaining delivery
+records are counted. A sink that ignores context can outlive that grace period;
+the process may exit before its eventual final summary. Shutdown is idempotent
+and cannot wait indefinitely for that sink.
 
 ## Consequences
 

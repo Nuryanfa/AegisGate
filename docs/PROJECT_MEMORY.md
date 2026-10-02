@@ -148,8 +148,9 @@ pipeline and adds deterministic process-local burst detection.
   counter.
 - A single detector goroutine owns bounded fixed-window state. `AG-D2001`
   counts stable rule IDs per route and `AG-D2002` counts blocks per route.
-  Cooldowns limit alert storms; at `max_keys`, expired entries are reclaimed
-  and otherwise new keys are dropped while existing keys continue.
+  Each key emits at most once per window at its exact threshold crossing;
+  cooldown can suppress a whole window. At `max_keys`, expired entries are
+  reclaimed and otherwise new keys are dropped while existing keys continue.
 - Detector output enters a second bounded queue. A fixed worker pool invokes a
   narrow sink with per-write timeouts. Failures are counted and do not stop
   workers; v0.6 has no retry or external broker.
@@ -158,7 +159,10 @@ pipeline and adds deterministic process-local burst detection.
   identities, addresses, internal errors, or request-owned objects.
 - Shutdown occurs only after HTTP drain, then closes publication, drains the
   detector and workers within a separate deadline, cancels outstanding sink
-  calls on timeout, and emits final internal statistics.
+  calls on timeout, allows a bounded cancellation grace period, and emits final
+  internal statistics only after every pipeline goroutine exits. If a sink
+  ignores cancellation, shutdown returns with a distinct diagnostic instead
+  of claiming the pipeline has stopped.
 - The pipeline is best effort, in-memory, process-local, non-durable, and may
   lose events under saturation, shutdown timeout, process failure, or sink
   failure. It is not a SIEM or cross-instance detector. ADR 0004 records this

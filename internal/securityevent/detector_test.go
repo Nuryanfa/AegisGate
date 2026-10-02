@@ -29,6 +29,52 @@ func TestDetectorThresholdIsolationAndMultipleRules(t *testing.T) {
 	}
 }
 
+func TestDetectorAlertsOncePerWindowEvenAfterCooldown(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(400, 0)}
+	d := newDetector(DetectionOptions{Enabled: true, Window: time.Minute, RuleMatchThreshold: 2,
+		BlockThreshold: 2, Cooldown: 5 * time.Second, MaxKeys: 10}, clock)
+	event := detectorEvent("users", "block", "AG-1001")
+	if alerts := d.process(event); len(alerts) != 0 {
+		t.Fatalf("below-threshold alerts = %#v", alerts)
+	}
+	if alerts := d.process(event); len(alerts) != 2 {
+		t.Fatalf("threshold alerts = %#v", alerts)
+	}
+	clock.Advance(6 * time.Second)
+	for range 3 {
+		if alerts := d.process(event); len(alerts) != 0 {
+			t.Fatalf("repeated alert in one fixed window = %#v", alerts)
+		}
+	}
+	clock.Advance(time.Minute)
+	if alerts := d.process(event); len(alerts) != 0 {
+		t.Fatalf("first event in new window alerted = %#v", alerts)
+	}
+	if alerts := d.process(event); len(alerts) != 2 || alerts[0].Count() != 2 || alerts[1].Count() != 2 {
+		t.Fatalf("new-window threshold alerts = %#v", alerts)
+	}
+}
+
+func TestDetectorDoesNotAlertAfterThresholdCrossingDuringCooldown(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(500, 0)}
+	d := newDetector(DetectionOptions{Enabled: true, Window: 10 * time.Second, RuleMatchThreshold: 2,
+		BlockThreshold: 2, Cooldown: 15 * time.Second, MaxKeys: 10}, clock)
+	event := detectorEvent("users", "audit", "AG-1001")
+	d.process(event)
+	if alerts := d.process(event); len(alerts) != 1 {
+		t.Fatalf("initial alert = %#v", alerts)
+	}
+	clock.Advance(11 * time.Second)
+	d.process(event)
+	if alerts := d.process(event); len(alerts) != 0 {
+		t.Fatalf("cooldown did not suppress crossing: %#v", alerts)
+	}
+	clock.Advance(5 * time.Second)
+	if alerts := d.process(event); len(alerts) != 0 {
+		t.Fatalf("alerted after threshold was already crossed: %#v", alerts)
+	}
+}
+
 func TestDetectorBlockWindowCooldownAndCleanup(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(200, 0)}
 	options := DetectionOptions{Enabled: true, Window: 5 * time.Second, RuleMatchThreshold: 2, BlockThreshold: 2, Cooldown: 10 * time.Second, MaxKeys: 10}

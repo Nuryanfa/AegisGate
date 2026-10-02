@@ -12,6 +12,7 @@ type ruleKey struct{ routeID, ruleID string }
 type windowState struct {
 	windowStart time.Time
 	count       int
+	alerted     bool
 	lastAlert   time.Time
 }
 
@@ -89,12 +90,13 @@ func (d *detector) update(state windowState, now time.Time, threshold int, detec
 		now = state.windowStart
 	}
 	if now.Sub(state.windowStart) >= d.options.Window {
-		state.windowStart, state.count = now, 0
+		state.windowStart, state.count, state.alerted = now, 0, false
 	}
 	state.count++
-	if state.count < threshold || (!state.lastAlert.IsZero() && now.Sub(state.lastAlert) < d.options.Cooldown) {
+	if state.count != threshold || state.alerted || (!state.lastAlert.IsZero() && now.Sub(state.lastAlert) < d.options.Cooldown) {
 		return state, nil
 	}
+	state.alerted = true
 	state.lastAlert = now
 	return state, &Alert{schemaVersion: AlertSchemaV1, detectorID: detectorID, generatedAt: now,
 		routeID: routeID, ruleID: ruleID, count: state.count, window: d.options.Window,

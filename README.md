@@ -205,8 +205,10 @@ endpoint.
 
 `AG-D2001` counts each stable WAF rule ID independently by route. `AG-D2002`
 counts block decisions by route. Both use fixed windows, exact thresholds,
-cooldown suppression, server-generated time, and a shared `max_keys` bound.
-At that bound, existing keys continue while new keys are dropped and counted.
+one alert per key per window, cooldown suppression, server-generated time, and
+a shared `max_keys` bound. A threshold crossed during cooldown does not alert
+later in that same window. At the key bound, existing keys continue while new
+keys are dropped and counted.
 Detection resets on process restart.
 
 `security_events` is optional when WAF is enabled; omission selects the values

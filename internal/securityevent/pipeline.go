@@ -41,12 +41,15 @@ type Pipeline struct {
 	publishMu   sync.RWMutex
 	accepting   bool
 	stopOnce    sync.Once
-	finalOnce   sync.Once
 	summaryStop chan struct{}
 	runWG       sync.WaitGroup
 	done        chan struct{}
 	counters    counters
 }
+
+// Cancellation gives context-aware sinks a brief, bounded chance to exit
+// after the shutdown deadline before the caller returns.
+const shutdownCancellationGrace = 250 * time.Millisecond
 
 func NewPipeline(options Options, sink Sink, logger *slog.Logger, clock Clock) (*Pipeline, error) {
 	if err := options.Validate(); err != nil {
@@ -74,6 +77,7 @@ func NewPipeline(options Options, sink Sink, logger *slog.Logger, clock Clock) (
 		if remaining := len(p.delivery); remaining > 0 {
 			p.counters.droppedDelivery.Add(uint64(remaining))
 		}
+		p.logSummary("security-event pipeline stopped")
 		close(p.done)
 	}()
 	return p, nil
@@ -104,16 +108,25 @@ func (p *Pipeline) Shutdown(ctx context.Context) error {
 		p.publishMu.Unlock()
 		close(p.summaryStop)
 	})
-	var err error
 	select {
 	case <-p.done:
 		p.cancel()
+		return nil
 	case <-ctx.Done():
-		err = ctx.Err()
 		p.cancel()
 	}
-	p.finalOnce.Do(func() { p.logSummary("security-event pipeline stopped") })
-	return err
+	grace := time.NewTimer(shutdownCancellationGrace)
+	defer grace.Stop()
+	select {
+	case <-p.done:
+	case <-grace.C:
+		select {
+		case <-p.done:
+		default:
+			p.logger.Warn("security-event pipeline shutdown cancellation requested")
+		}
+	}
+	return ctx.Err()
 }
 
 func (p *Pipeline) Snapshot() Snapshot {

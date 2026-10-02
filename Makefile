@@ -1,4 +1,4 @@
-.PHONY: run run-upstream run-users run-orders generate-key build test test-integration test-race test-fuzz bench-waf fmt vet tidy check
+.PHONY: run run-upstream run-users run-orders generate-key build test test-integration test-race test-fuzz bench-waf bench-security-events fmt vet tidy check
 
 run:
 	AEGIS_CONFIG_PATH=configs/config.example.yaml go run ./cmd/gateway
@@ -34,6 +34,9 @@ test-fuzz:
 
 bench-waf:
 	go test ./internal/waf -run=^$$ -bench=BenchmarkWAF -benchmem -count=1 -benchtime=500ms
+
+bench-security-events:
+	go test ./internal/securityevent -run=^$$ -bench='Benchmark(Publish|Detector)' -benchmem -count=1 -benchtime=500ms
 
 fmt:
 	gofmt -w .

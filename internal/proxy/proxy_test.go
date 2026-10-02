@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/securityevent"
 	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
 
@@ -559,9 +561,10 @@ func TestWAFAuditAndEnforcePipeline(t *testing.T) {
 		mode         string
 		wantStatus   int
 		wantUpstream int32
+		wantAction   string
 	}{
-		{"audit", http.StatusAccepted, 1},
-		{"enforce", http.StatusForbidden, 0},
+		{"audit", http.StatusAccepted, 1, "audit"},
+		{"enforce", http.StatusForbidden, 0, "block"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.mode, func(t *testing.T) {
@@ -574,14 +577,17 @@ func TestWAFAuditAndEnforcePipeline(t *testing.T) {
 			route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
 			policy := proxyWAFPolicy(t, tt.mode, 5, false)
 			route.WAF = &policy
-			var logs bytes.Buffer
-			logger := slog.New(slog.NewJSONHandler(&logs, nil))
-			handler, err := NewWithPolicies([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), logger)
+			publisher := &stubSecurityEventPublisher{accept: true}
+			handler, err := NewWithSecurityEvents([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), publisher, discardLogger())
 			if err != nil {
-				t.Fatalf("NewWithPolicies() error = %v", err)
+				t.Fatalf("NewWithSecurityEvents() error = %v", err)
 			}
-			request := httptest.NewRequest(http.MethodGet, "/api/users?q=1%27+OR+1%3D1--", nil)
+			request := httptest.NewRequest(http.MethodPost, "/api/users?q=1%27+OR+1%3D1--", strings.NewReader("body-secret-must-not-appear"))
+			request.RemoteAddr = "203.0.113.77:4321"
 			request.Header.Set(auth.HeaderName, "secret-must-not-appear")
+			request.Header.Set("Authorization", "authorization-secret-must-not-appear")
+			request.Header.Set("Cookie", "cookie-secret-must-not-appear")
+			request.Header.Set("X-Aegis-Client-ID", "client-secret-must-not-appear")
 			response := httptest.NewRecorder()
 			middleware.RequestID(handler).ServeHTTP(response, request)
 			if response.Code != tt.wantStatus {
@@ -590,13 +596,117 @@ func TestWAFAuditAndEnforcePipeline(t *testing.T) {
 			if upstreamCalls.Load() != tt.wantUpstream {
 				t.Fatalf("upstream calls = %d, want %d", upstreamCalls.Load(), tt.wantUpstream)
 			}
-			if !strings.Contains(logs.String(), "AG-1001") || strings.Contains(logs.String(), "secret-must-not-appear") || strings.Contains(logs.String(), "OR 1=1") {
-				t.Fatalf("unsafe or incomplete security log: %s", logs.String())
+			events := publisher.Events()
+			if len(events) != 1 {
+				t.Fatalf("published events = %d, want 1", len(events))
+			}
+			event := events[0]
+			if event.SchemaVersion() != securityevent.EventSchemaV1 || event.RouteID() != "users" ||
+				len(event.MatchedRuleIDs()) != 1 || event.MatchedRuleIDs()[0] != "AG-1001" || event.Action() != tt.wantAction {
+				t.Fatalf("unexpected security event: schema=%q route=%q rules=%v action=%q",
+					event.SchemaVersion(), event.RouteID(), event.MatchedRuleIDs(), event.Action())
+			}
+			allowedValues := strings.Join(append([]string{
+				event.RequestID(), event.RouteID(), event.WAFMode(), event.Action(), event.ReasonClass(),
+				event.HighestSeverity(), event.Method(), event.PathClassification(),
+			}, event.MatchedRuleIDs()...), " ")
+			for _, forbidden := range []string{"secret-must-not-appear", "OR 1=1", "203.0.113.77"} {
+				if strings.Contains(allowedValues, forbidden) {
+					t.Fatalf("security event leaked request data %q: %q", forbidden, allowedValues)
+				}
 			}
 			if tt.mode == "enforce" {
 				assertJSONError(t, response, http.StatusForbidden, "WAF_BLOCKED")
 			}
 		})
+	}
+}
+
+func TestSlowSecuritySinkDoesNotDelayHTTPDecisions(t *testing.T) {
+	for _, tt := range []struct {
+		mode         string
+		wantStatus   int
+		wantUpstream int32
+	}{
+		{mode: "audit", wantStatus: http.StatusAccepted, wantUpstream: 2},
+		{mode: "enforce", wantStatus: http.StatusForbidden, wantUpstream: 1},
+	} {
+		t.Run(tt.mode, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer upstream.Close()
+
+			sink := newBlockingSecuritySink()
+			options := securityevent.DefaultOptions()
+			options.QueueCapacity = 1
+			options.DeliveryCapacity = 1
+			options.Workers = 1
+			options.SinkTimeout = 2 * time.Second
+			options.ShutdownTimeout = 2 * time.Second
+			options.SummaryInterval = time.Hour
+			options.Detection = securityevent.DetectionOptions{}
+			pipeline, err := securityevent.NewPipeline(options, sink, discardLogger(), nil)
+			if err != nil {
+				t.Fatalf("NewPipeline() error = %v", err)
+			}
+			defer func() {
+				sink.Release()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				if err := pipeline.Shutdown(ctx); err != nil {
+					t.Errorf("Shutdown() error = %v", err)
+				}
+			}()
+
+			if !pipeline.Publish(proxyTestSecurityEvent()) {
+				t.Fatal("initial security event was not accepted")
+			}
+			select {
+			case <-sink.started:
+			case <-time.After(time.Second):
+				t.Fatal("sink did not begin processing")
+			}
+			for i := 0; i < 100 && pipeline.Snapshot().DroppedIngressTotal == 0; i++ {
+				pipeline.Publish(proxyTestSecurityEvent())
+			}
+			if pipeline.Snapshot().DroppedIngressTotal == 0 {
+				t.Fatal("failed to saturate bounded pipeline")
+			}
+
+			route := publicRoute(t, "users", "/api/users", upstream.URL, time.Second)
+			policy := proxyWAFPolicy(t, tt.mode, 5, false)
+			route.WAF = &policy
+			handler, err := NewWithSecurityEvents([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), pipeline, discardLogger())
+			if err != nil {
+				t.Fatalf("NewWithSecurityEvents() error = %v", err)
+			}
+			requestHandler := middleware.RequestID(handler)
+
+			benign := serveWithin(t, requestHandler, httptest.NewRequest(http.MethodGet, "/api/users?q=hello", nil), 500*time.Millisecond)
+			if benign.Code != http.StatusAccepted {
+				t.Fatalf("benign status = %d, want %d", benign.Code, http.StatusAccepted)
+			}
+
+			blockedOrAudited := serveWithin(t, requestHandler, httptest.NewRequest(http.MethodGet, "/api/users?q=1%27+OR+1%3D1--", nil), 500*time.Millisecond)
+			if blockedOrAudited.Code != tt.wantStatus {
+				t.Fatalf("WAF status = %d, want %d", blockedOrAudited.Code, tt.wantStatus)
+			}
+			if upstreamCalls.Load() != tt.wantUpstream {
+				t.Fatalf("upstream calls = %d, want %d", upstreamCalls.Load(), tt.wantUpstream)
+			}
+		})
+	}
+}
+
+func TestSecurityEventPublisherRequiredForWAF(t *testing.T) {
+	route := publicRoute(t, "users", "/api/users", "http://upstream.example", time.Second)
+	policy := proxyWAFPolicy(t, "audit", 5, false)
+	route.WAF = &policy
+	if _, err := NewWithSecurityEvents([]router.Route{route}, emptyRegistry(t), nil, waf.NewEngine(), nil, discardLogger()); err == nil {
+		t.Fatal("NewWithSecurityEvents() accepted a WAF route without a publisher")
 	}
 }
 
@@ -740,6 +850,31 @@ func upstreamNameHandler(name string) http.Handler {
 	})
 }
 
+func serveWithin(t *testing.T, handler http.Handler, request *http.Request, timeout time.Duration) *httptest.ResponseRecorder {
+	t.Helper()
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, request)
+		close(done)
+	}()
+	select {
+	case <-done:
+		return response
+	case <-time.After(timeout):
+		t.Fatalf("HTTP handler did not complete within %s", timeout)
+		return nil
+	}
+}
+
+func proxyTestSecurityEvent() securityevent.Event {
+	return securityevent.NewEvent(securityevent.EventInput{
+		OccurredAt: time.Now(), RouteID: "users", WAFMode: "audit", Action: "audit",
+		ReasonClass: "rule_match", MatchedRuleIDs: []string{"AG-1001"}, Method: http.MethodGet,
+		PathClassification: "configured_route",
+	})
+}
+
 func publicRoute(t *testing.T, id, pathPrefix, upstream string, timeout time.Duration) router.Route {
 	t.Helper()
 	policy, err := auth.NewPolicy("public", nil)
@@ -808,6 +943,50 @@ type stubInspector struct {
 	result waf.Result
 	err    error
 	calls  atomic.Int32
+}
+
+type stubSecurityEventPublisher struct {
+	mu     sync.Mutex
+	events []securityevent.Event
+	accept bool
+}
+
+type blockingSecuritySink struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newBlockingSecuritySink() *blockingSecuritySink {
+	return &blockingSecuritySink{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *blockingSecuritySink) Write(ctx context.Context, _ securityevent.Record) error {
+	s.startedOnce.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *blockingSecuritySink) Release() {
+	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+func (p *stubSecurityEventPublisher) Publish(event securityevent.Event) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, event)
+	return p.accept
+}
+
+func (p *stubSecurityEventPublisher) Events() []securityevent.Event {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]securityevent.Event(nil), p.events...)
 }
 
 func (i *stubInspector) Inspect(_ *http.Request, _ waf.Policy) (waf.Result, error) {

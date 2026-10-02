@@ -92,6 +92,26 @@ func TestLoadRequiresReadableConfiguration(t *testing.T) {
 	})
 }
 
+func TestCommittedExampleConfigurationsValidate(t *testing.T) {
+	for _, name := range []string{"config.example.yaml", "config.docker.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			prepareEnvironment(t)
+			path, err := filepath.Abs(filepath.Join("..", "..", "configs", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("AEGIS_CONFIG_PATH", path)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(%s) error = %v", name, err)
+			}
+			if cfg.SecurityEvents == nil {
+				t.Fatalf("%s did not enable security events", name)
+			}
+		})
+	}
+}
+
 func TestLoadValidRateLimitAndRedisConfiguration(t *testing.T) {
 	prepareEnvironment(t)
 	t.Setenv("AEGIS_REDIS_USERNAME", "gateway")
@@ -146,6 +166,9 @@ func TestLoadWAFPoliciesAndV04Migration(t *testing.T) {
 			if cfg.Routes[0].WAF == nil || string(cfg.Routes[0].WAF.Mode()) != mode {
 				t.Fatalf("WAF policy = %#v", cfg.Routes[0].WAF)
 			}
+			if cfg.SecurityEvents == nil || cfg.SecurityEvents.QueueCapacity != 1024 || !cfg.SecurityEvents.Detection.Enabled {
+				t.Fatalf("default security-event options = %#v", cfg.SecurityEvents)
+			}
 		})
 	}
 
@@ -158,6 +181,25 @@ func TestLoadWAFPoliciesAndV04Migration(t *testing.T) {
 			t.Fatalf("Load() = %#v, %v", cfg, err)
 		}
 	})
+}
+
+func TestLoadExplicitSecurityEventConfiguration(t *testing.T) {
+	prepareEnvironment(t)
+	configuration := validSecurityEventsYAML() + configWithWAF(validWAFYAML("audit"))
+	t.Setenv("AEGIS_CONFIG_PATH", writeConfig(t, configuration))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SecurityEvents == nil {
+		t.Fatal("security-event options are nil")
+	}
+	got := cfg.SecurityEvents
+	if got.QueueCapacity != 64 || got.DeliveryCapacity != 32 || got.Workers != 3 || got.SinkTimeout != 250*time.Millisecond ||
+		got.ShutdownTimeout != 2*time.Second || got.SummaryInterval != 5*time.Second || got.Detection.Window != 10*time.Second ||
+		got.Detection.RuleMatchThreshold != 4 || got.Detection.BlockThreshold != 3 || got.Detection.Cooldown != 20*time.Second || got.Detection.MaxKeys != 100 {
+		t.Fatalf("security-event options = %#v", *got)
+	}
 }
 
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
@@ -197,6 +239,15 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "excessive body limit", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "max_body_bytes: 1048576", "max_body_bytes: 2097153", 1)), wantError: "max_body_bytes"},
 		{name: "disabled contradiction", configuration: configWithWAF("    waf:\n      mode: disabled\n      rule_set: core-v1\n"), wantError: "disabled mode"},
 		{name: "unknown WAF field", configuration: configWithWAF(validWAFYAML("audit") + "      typo: true\n"), wantError: "field typo not found"},
+		{name: "unused security events", configuration: validSecurityEventsYAML() + validConfig(), wantError: "security_events configuration is unused"},
+		{name: "missing security event detection", configuration: "security_events:\n  queue_capacity: 10\n  delivery_capacity: 10\n  workers: 1\n  sink_timeout: 1s\n  shutdown_timeout: 1s\n  summary_interval: 1s\n" + configWithWAF(validWAFYAML("audit")), wantError: "detection is required"},
+		{name: "zero ingress queue", configuration: strings.Replace(validSecurityEventsYAML(), "queue_capacity: 64", "queue_capacity: 0", 1) + configWithWAF(validWAFYAML("audit")), wantError: "queue_capacity must be between"},
+		{name: "excessive workers", configuration: strings.Replace(validSecurityEventsYAML(), "workers: 3", "workers: 65", 1) + configWithWAF(validWAFYAML("audit")), wantError: "workers must be between"},
+		{name: "missing sink timeout", configuration: strings.Replace(validSecurityEventsYAML(), "  sink_timeout: 250ms\n", "", 1) + configWithWAF(validWAFYAML("audit")), wantError: "sink_timeout is required"},
+		{name: "zero detection threshold", configuration: strings.Replace(validSecurityEventsYAML(), "rule_match_threshold: 4", "rule_match_threshold: 0", 1) + configWithWAF(validWAFYAML("audit")), wantError: "rule_match_threshold"},
+		{name: "disabled detection contradiction", configuration: strings.Replace(validSecurityEventsYAML(), "enabled: true", "enabled: false", 1) + configWithWAF(validWAFYAML("audit")), wantError: "must not define unused"},
+		{name: "unknown security event field", configuration: strings.Replace(validSecurityEventsYAML(), "  workers: 3", "  workers: 3\n  retry_forever: true", 1) + configWithWAF(validWAFYAML("audit")), wantError: "field retry_forever not found"},
+		{name: "unknown detection field", configuration: strings.Replace(validSecurityEventsYAML(), "    max_keys: 100", "    max_keys: 100\n    expression: arbitrary", 1) + configWithWAF(validWAFYAML("audit")), wantError: "field expression not found"},
 		{
 			name: "duplicate IDs",
 			configuration: routesConfig(
@@ -387,6 +438,23 @@ func validWAFYAML(mode string) string {
 
 func configWithWAF(wafYAML string) string {
 	return strings.Replace(validConfig(), "    auth:\n      mode: public\n", "    auth:\n      mode: public\n"+wafYAML, 1)
+}
+
+func validSecurityEventsYAML() string {
+	return "security_events:\n" +
+		"  queue_capacity: 64\n" +
+		"  delivery_capacity: 32\n" +
+		"  workers: 3\n" +
+		"  sink_timeout: 250ms\n" +
+		"  shutdown_timeout: 2s\n" +
+		"  summary_interval: 5s\n" +
+		"  detection:\n" +
+		"    enabled: true\n" +
+		"    window: 10s\n" +
+		"    rule_match_threshold: 4\n" +
+		"    block_threshold: 3\n" +
+		"    cooldown: 20s\n" +
+		"    max_keys: 100\n"
 }
 
 func unsetEnv(t *testing.T, key string) {

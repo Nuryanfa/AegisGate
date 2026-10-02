@@ -14,6 +14,7 @@ import (
 	"github.com/Nuryanfa/AegisGate/internal/proxy"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
+	"github.com/Nuryanfa/AegisGate/internal/securityevent"
 	"github.com/Nuryanfa/AegisGate/internal/server"
 	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
@@ -53,8 +54,22 @@ func main() {
 			}
 		}()
 	}
-	proxyHandler, err := proxy.NewWithPolicies(cfg.Routes, registry, limiter, waf.NewEngine(), logger)
+	var eventPipeline *securityevent.Pipeline
+	if cfg.SecurityEvents != nil {
+		sink, err := securityevent.NewSlogSink(logger)
+		if err != nil {
+			logger.Error("build security-event sink", "error", err)
+			os.Exit(1)
+		}
+		eventPipeline, err = securityevent.NewPipeline(*cfg.SecurityEvents, sink, logger, nil)
+		if err != nil {
+			logger.Error("build security-event pipeline", "error", err)
+			os.Exit(1)
+		}
+	}
+	proxyHandler, err := proxy.NewWithSecurityEvents(cfg.Routes, registry, limiter, waf.NewEngine(), eventPipeline, logger)
 	if err != nil {
+		shutdownSecurityEvents(eventPipeline, cfg.SecurityEvents, logger)
 		logger.Error("build gateway routes", "error", err)
 		os.Exit(1)
 	}
@@ -85,10 +100,24 @@ func main() {
 		"api_key_count", len(cfg.APIKeys),
 		"rate_limited_route_count", rateLimitedRouteCount(cfg.Routes),
 		"waf_enabled_route_count", wafEnabledRouteCount(cfg.Routes),
+		"security_event_pipeline_enabled", eventPipeline != nil,
 	)
-	if err := httpServer.Run(ctx, cfg.ShutdownTimeout); err != nil {
-		logger.Error("gateway stopped with an error", "error", err)
+	runErr := httpServer.Run(ctx, cfg.ShutdownTimeout)
+	shutdownSecurityEvents(eventPipeline, cfg.SecurityEvents, logger)
+	if runErr != nil {
+		logger.Error("gateway stopped with an error", "error", runErr)
 		os.Exit(1)
+	}
+}
+
+func shutdownSecurityEvents(pipeline *securityevent.Pipeline, options *securityevent.Options, logger *slog.Logger) {
+	if pipeline == nil || options == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), options.ShutdownTimeout)
+	defer cancel()
+	if err := pipeline.Shutdown(ctx); err != nil {
+		logger.Warn("security-event pipeline shutdown deadline reached")
 	}
 }
 

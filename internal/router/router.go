@@ -10,6 +10,7 @@ import (
 
 	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
+	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
 
 // Route describes one validated gateway route and its upstream policy.
@@ -20,6 +21,7 @@ type Route struct {
 	Timeout    time.Duration
 	Auth       auth.Policy
 	RateLimit  *ratelimit.Policy
+	WAF        *waf.Policy
 }
 
 // Router matches request paths against an immutable, deterministic route set.
@@ -63,6 +65,11 @@ func New(routes []Route) (*Router, error) {
 		if route.RateLimit != nil {
 			if err := route.RateLimit.Validate(); err != nil {
 				return nil, fmt.Errorf("route %q rate-limit policy: %w", route.ID, err)
+			}
+		}
+		if route.WAF != nil {
+			if err := route.WAF.Validate(); err != nil {
+				return nil, fmt.Errorf("route %q WAF policy: %w", route.ID, err)
 			}
 		}
 		compiled = append(compiled, route)

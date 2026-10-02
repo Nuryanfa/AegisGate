@@ -120,6 +120,46 @@ func TestLoadValidRateLimitAndRedisConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadWAFPoliciesAndV04Migration(t *testing.T) {
+	t.Run("omitted remains disabled", func(t *testing.T) {
+		prepareEnvironment(t)
+		t.Setenv("AEGIS_CONFIG_PATH", writeConfig(t, validConfig()))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Routes[0].WAF != nil {
+			t.Fatal("v0.4 route unexpectedly enabled WAF")
+		}
+	})
+
+	for _, mode := range []string{"audit", "enforce"} {
+		t.Run(mode, func(t *testing.T) {
+			prepareEnvironment(t)
+			configuration := validConfig() + ""
+			configuration = strings.Replace(configuration, "    auth:\n      mode: public\n", "    auth:\n      mode: public\n"+validWAFYAML(mode), 1)
+			t.Setenv("AEGIS_CONFIG_PATH", writeConfig(t, configuration))
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Routes[0].WAF == nil || string(cfg.Routes[0].WAF.Mode()) != mode {
+				t.Fatalf("WAF policy = %#v", cfg.Routes[0].WAF)
+			}
+		})
+	}
+
+	t.Run("explicit disabled needs no unused settings", func(t *testing.T) {
+		prepareEnvironment(t)
+		configuration := strings.Replace(validConfig(), "    auth:\n      mode: public\n", "    auth:\n      mode: public\n    waf:\n      mode: disabled\n", 1)
+		t.Setenv("AEGIS_CONFIG_PATH", writeConfig(t, configuration))
+		cfg, err := Load()
+		if err != nil || cfg.Routes[0].WAF == nil || cfg.Routes[0].WAF.Enabled() {
+			t.Fatalf("Load() = %#v, %v", cfg, err)
+		}
+	})
+}
+
 func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -147,6 +187,16 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		{name: "unknown Redis failure mode", configuration: rateLimitedConfig(validRedisYAML(), strings.Replace(validRateLimitYAML(), "deny", "maybe", 1)), wantError: "unsupported on_redis_error"},
 		{name: "unknown rate-limit field", configuration: rateLimitedConfig(validRedisYAML(), validRateLimitYAML()+"      typo: true\n"), wantError: "field typo not found"},
 		{name: "unknown Redis field", configuration: rateLimitedConfig("redis:\n  address: redis:6379\n  password: do-not-leak\n", validRateLimitYAML()), wantError: "field password not found"},
+		{name: "unknown WAF mode", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "mode: audit", "mode: observe", 1)), wantError: "unsupported mode"},
+		{name: "unknown WAF rule set", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "core-v1", "core-v2", 1)), wantError: "unsupported rule_set"},
+		{name: "zero WAF threshold", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "anomaly_threshold: 5", "anomaly_threshold: 0", 1)), wantError: "anomaly_threshold"},
+		{name: "excessive WAF threshold", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "anomaly_threshold: 5", "anomaly_threshold: 101", 1)), wantError: "anomaly_threshold"},
+		{name: "missing WAF inspection", configuration: configWithWAF("    waf:\n      mode: audit\n      rule_set: core-v1\n      anomaly_threshold: 5\n"), wantError: "inspection is required"},
+		{name: "missing enabled limit", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "        max_query_bytes: 8192\n", "", 1)), wantError: "max_query_bytes"},
+		{name: "unused limit", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "        query: true", "        query: false", 1)), wantError: "max_query_bytes requires"},
+		{name: "excessive body limit", configuration: configWithWAF(strings.Replace(validWAFYAML("audit"), "max_body_bytes: 1048576", "max_body_bytes: 2097153", 1)), wantError: "max_body_bytes"},
+		{name: "disabled contradiction", configuration: configWithWAF("    waf:\n      mode: disabled\n      rule_set: core-v1\n"), wantError: "disabled mode"},
+		{name: "unknown WAF field", configuration: configWithWAF(validWAFYAML("audit") + "      typo: true\n"), wantError: "field typo not found"},
 		{
 			name: "duplicate IDs",
 			configuration: routesConfig(
@@ -317,6 +367,26 @@ func validRedisYAML() string {
 
 func validRateLimitYAML() string {
 	return "    rate_limit:\n      capacity: 20\n      refill_per_second: 5\n      on_redis_error: deny\n"
+}
+
+func validWAFYAML(mode string) string {
+	return "    waf:\n" +
+		"      mode: " + mode + "\n" +
+		"      rule_set: core-v1\n" +
+		"      anomaly_threshold: 5\n" +
+		"      inspection:\n" +
+		"        query: true\n" +
+		"        headers: true\n" +
+		"        body: true\n" +
+		"        max_query_bytes: 8192\n" +
+		"        max_header_bytes: 16384\n" +
+		"        max_body_bytes: 1048576\n" +
+		"        max_json_depth: 20\n" +
+		"        max_json_elements: 1000\n"
+}
+
+func configWithWAF(wafYAML string) string {
+	return strings.Replace(validConfig(), "    auth:\n      mode: public\n", "    auth:\n      mode: public\n"+wafYAML, 1)
 }
 
 func unsetEnv(t *testing.T, key string) {

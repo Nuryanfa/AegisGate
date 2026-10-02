@@ -1,8 +1,8 @@
 # AegisGate
 
 AegisGate is a portfolio-grade API gateway and security platform written in
-Go. v0.4 adds Redis-backed distributed token-bucket rate limiting to the
-authenticated and strictly configured v0.3 gateway.
+Go. v0.5 adds bounded per-route request inspection and a small auditable WAF
+rule engine to the authenticated, distributed-rate-limited v0.4 gateway.
 
 This is an educational, production-like project, not a claim of production
 readiness. An API key identifies a calling application, not a human user.
@@ -16,7 +16,10 @@ readiness. An API key identifies a calling application, not a human user.
 - SHA-256-only key registry with all-required scope authorization
 - Atomic Redis token buckets shared across gateway instances
 - Explicit per-route fail-open or fail-closed Redis behavior
-- JSON `401`, `403`, `404`, `429`, `502`, `503`, and `504` errors
+- Per-route WAF `disabled`, `audit`, and `enforce` modes with anomaly scoring
+- Bounded query, header, JSON, form, and plain-text inspection
+- JSON `400`, `401`, `403`, `404`, `413`, `414`, `415`, `429`, `502`, `503`, and
+  `504` errors
 - Request IDs, structured logs, forwarding-header sanitization, health checks,
   graceful shutdown, and race-oriented tests
 - Non-root image and Compose demo with internal-only Redis
@@ -65,6 +68,19 @@ routes:
       capacity: 20
       refill_per_second: 5
       on_redis_error: deny
+    waf:
+      mode: audit
+      rule_set: core-v1
+      anomaly_threshold: 5
+      inspection:
+        query: true
+        headers: true
+        body: true
+        max_query_bytes: 8192
+        max_header_bytes: 16384
+        max_body_bytes: 1048576
+        max_json_depth: 20
+        max_json_elements: 1000
 
   - id: orders
     path_prefix: /api/orders
@@ -118,6 +134,41 @@ the time needed to refill an empty bucket, between one second and 24 hours.
 unavailable and at least one route uses fail-closed `deny`. A configuration
 containing only fail-open policies remains ready during that outage.
 
+### WAF semantics
+
+`waf` is optional per route; omission means no inspection. Explicit
+`mode: disabled` takes no rule set, threshold, inspection flags, or unused
+limits. `audit` evaluates `core-v1`, logs one bounded security event when a
+rule matches, and forwards the request. `enforce` returns JSON `403` with code
+`WAF_BLOCKED` when the summed score reaches `anomaly_threshold`. Thresholds
+must be 1–100. Unknown fields, modes, and rule sets fail startup.
+
+The active request order is route match, authentication/authorization, Redis
+rate limiting, WAF inspection, then reverse proxy. Method and decoded path are
+always represented. Enabled query inspection decodes percent escapes exactly
+once, treats `+` as space, and preserves duplicate values separately. Header
+inspection excludes credential and cookie values. Text must be valid UTF-8 and
+must not contain NUL. Original URL, headers, and exact buffered body bytes are
+unchanged for forwarding.
+
+Body inspection supports `application/json`,
+`application/x-www-form-urlencoded`, and `text/plain` with absent or UTF-8
+charset. A non-empty inspected body with a missing or unsupported media type,
+multipart content, unsupported charset, or compression returns `415`.
+Malformed encodings or JSON return `400`; oversize bodies and excessive JSON
+element counts return `413`. These hard parsing and resource limits also apply
+in audit mode. Chunked bodies use the same hard byte limit. Multipart files are
+not scanned.
+
+Method and path have fixed 32-byte and 8 KiB inspection ceilings.
+Configuration maxima are 64 KiB each for query and headers, 2 MiB for body,
+JSON depth 64, and 10,000 JSON elements. `core-v1` contains six immutable,
+startup-compiled rules (`AG-1001`–`AG-1006`) for selected strong SQLi, XSS,
+traversal, command-injection, ambiguous-encoding, and method-override signals.
+It does not join separate request fields or repeatedly decode values. See
+[`ADR 0003`](docs/adr/0003-bounded-request-inspection.md) for the exact
+normalization, scoring, failure, privacy, and limitation contract.
+
 ### Routing and timeouts
 
 `/api/users` matches itself and `/api/users/42`, not `/api/users-v2`; the
@@ -146,12 +197,12 @@ Committed example digests are deliberately non-working placeholders. Copy
 `configs/config.example.yaml` to the gitignored `configs/local.yaml`, generate
 two keys, and grant `orders:read` to only one to run the full demo.
 
-### Migrate from v0.3
+### Migrate from v0.4
 
-Existing v0.3 files remain valid and have no rate limiting. To enable v0.4,
-add the top-level `redis` settings and a `rate_limit` block to each route that
-needs a quota. Choose `on_redis_error` deliberately. Restart all gateways after
-changing policy; configuration is still startup-only.
+Existing v0.4 files remain valid and have no WAF inspection. Add a complete
+per-route `waf` block to opt in. Roll out `disabled -> audit -> review false
+positives -> tune threshold or route policy -> enforce`. Restart all gateways
+after changing policy; configuration is still startup-only.
 
 ## Run locally
 
@@ -247,6 +298,22 @@ curl.exe -i http://localhost:8080/api/users/42
 Both return `503`; `/healthz` remains `200`. Change a route explicitly to
 `on_redis_error: allow` to demonstrate forwarding during the outage.
 
+The committed Docker configuration runs `users` in WAF audit mode and `orders`
+in enforce mode. A benign users request and a representative audit match both
+reach the users upstream; the match produces a metadata-only gateway event:
+
+```powershell
+curl.exe -i "http://localhost:8080/api/users/42?q=hello"
+curl.exe -i "http://localhost:8080/api/users/42?q=1%27%20OR%201%3D1--"
+```
+
+After placing a valid digest in a gitignored Docker configuration, the
+equivalent protected orders request is blocked before its upstream:
+
+```powershell
+curl.exe -i -H "X-API-Key: $env:ORDERS_API_KEY" "http://localhost:8080/api/orders/42?q=1%27%20OR%201%3D1--"
+```
+
 ## Security model
 
 Authorization follows one route match and precedes upstream work. A protected
@@ -261,8 +328,17 @@ DDoS attacks and does not replace user authorization. Public IP quotas group
 users behind NAT and are not proxy-aware because no trusted-proxy model exists.
 Invalid-key attempts are rejected before authenticated-client charging; a
 separate direct-peer brute-force limiter is deferred. See
-[`ADR 0001`](docs/adr/0001-api-client-key-trust-model.md) and
-[`ADR 0002`](docs/adr/0002-redis-token-bucket-rate-limiting.md).
+[`ADR 0001`](docs/adr/0001-api-client-key-trust-model.md),
+[`ADR 0002`](docs/adr/0002-redis-token-bucket-rate-limiting.md), and
+[`ADR 0003`](docs/adr/0003-bounded-request-inspection.md).
+
+The WAF is intentionally small and signature-based. It is not OWASP CRS,
+ModSecurity, an enterprise WAF, an IDS, malware scanning, or DDoS mitigation.
+It cannot prove a request safe. Upstreams must still use parameterized SQL,
+contextual output encoding, allowlist validation, safe process execution,
+filesystem authorization, and resource-level authorization. Security events
+never include API keys, authorization/cookie values, query strings, bodies,
+raw evidence, arbitrary header values, client identity, or peer address.
 
 ## Checks
 
@@ -280,8 +356,10 @@ $env:AEGIS_REDIS_INTEGRATION_ADDR="127.0.0.1:6379"
 go test -count=1 -v ./internal/ratelimit
 ```
 
-Make targets include `generate-key`, `fmt`, `tidy`, `check`, `test-race`, and
-`build`.
+Make targets include `generate-key`, `fmt`, `tidy`, `check`, `test-race`,
+`test-fuzz`, `bench-waf`, and `build`. The measured v0.5 WAF microbenchmark,
+including environment and inputs, is recorded in
+[`docs/benchmarks/v0.5-waf.md`](docs/benchmarks/v0.5-waf.md).
 
 ## Workflow and roadmap
 
@@ -293,8 +371,8 @@ start from `develop`. Promote milestones only after validation and review.
 | v0.1 | Gateway foundation | Implemented |
 | v0.2 | Configurable routing and timeouts | Implemented |
 | v0.3 | API-client authentication and route authorization | Implemented |
-| v0.4 | Redis-backed distributed rate limiting | Implemented on feature branch |
-| v0.5 | Bounded request inspection and WAF rules | Next |
+| v0.4 | Redis-backed distributed rate limiting | Released (`v0.4.0`) |
+| v0.5 | Bounded request inspection and WAF rules | Implemented on feature branch |
 | v0.6–v0.8 | Detection, observability, distributed deployment | Planned |
 
 ## License

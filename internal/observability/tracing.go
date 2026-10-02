@@ -76,6 +76,11 @@ func (t *Tracing) Inject(ctx context.Context, header http.Header) {
 	header.Del("tracestate")
 	header.Del("baggage")
 	if t != nil && t.enabled {
+		// Keep the trace/span identity, but do not relay client-controlled
+		// tracestate vendor entries across the gateway trust boundary.
+		if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
+			ctx = trace.ContextWithSpanContext(ctx, spanContext.WithTraceState(trace.TraceState{}))
+		}
 		t.propagator.Inject(ctx, propagation.HeaderCarrier(header))
 	}
 }

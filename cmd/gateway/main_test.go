@@ -1,12 +1,54 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"testing"
 
+	"github.com/Nuryanfa/AegisGate/internal/config"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 	"github.com/Nuryanfa/AegisGate/internal/waf"
 )
+
+func TestSuppliedBuildMetadataAppearsInStartupAndMetrics(t *testing.T) {
+	oldVersion, oldCommit, oldBuildTime := version, commit, buildTime
+	version, commit, buildTime = "v0.7.0-rc1", "abc123def456", "2026-10-02T12:00:00Z"
+	t.Cleanup(func() { version, commit, buildTime = oldVersion, oldCommit, oldBuildTime })
+
+	var output bytes.Buffer
+	logStartup(slog.New(slog.NewJSONHandler(&output, nil)), config.Config{Environment: "test"}, nil, nil, nil)
+	var entry map[string]any
+	if err := json.Unmarshal(output.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["msg"] != "AegisGate initialized" || entry["version"] != version || entry["commit"] != commit || entry["build_time"] != buildTime {
+		t.Fatalf("startup metadata = %v", entry)
+	}
+
+	families, err := newBuildMetrics(nil).Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "aegisgate_build_info" {
+			continue
+		}
+		if len(family.Metric) != 1 || family.Metric[0].Gauge.GetValue() != 1 {
+			t.Fatal("invalid build info gauge")
+		}
+		got := make(map[string]string)
+		for _, label := range family.Metric[0].Label {
+			got[label.GetName()] = label.GetValue()
+		}
+		if got["version"] != version || got["commit"] != commit || got["build_time"] != buildTime {
+			t.Fatalf("build_info labels = %v", got)
+		}
+		return
+	}
+	t.Fatal("aegisgate_build_info missing")
+}
 
 func TestRateLimitReadinessDependencySelection(t *testing.T) {
 	deny := mustGatewayRatePolicy(t, "deny")

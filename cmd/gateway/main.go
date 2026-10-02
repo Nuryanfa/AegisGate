@@ -79,7 +79,7 @@ func main() {
 	var tracing *observability.Tracing
 	if cfg.Observability != nil {
 		if cfg.Observability.Metrics.Enabled {
-			metrics = observability.NewMetrics(version, commit, buildTime, eventPipeline)
+			metrics = newBuildMetrics(eventPipeline)
 		}
 		if cfg.Observability.Tracing.Enabled {
 			tracing, err = observability.NewTracing(context.Background(), *cfg.Observability, version, nil)
@@ -128,17 +128,7 @@ func main() {
 		}
 	}
 
-	logger.Info("AegisGate initialized",
-		"environment", cfg.Environment,
-		"route_count", len(cfg.Routes),
-		"api_key_count", len(cfg.APIKeys),
-		"rate_limited_route_count", rateLimitedRouteCount(cfg.Routes),
-		"waf_enabled_route_count", wafEnabledRouteCount(cfg.Routes),
-		"security_event_pipeline_enabled", eventPipeline != nil,
-		"metrics_enabled", metrics != nil,
-		"tracing_enabled", tracing != nil,
-		"version", version, "commit", commit, "build_time", buildTime,
-	)
+	logStartup(logger, cfg, eventPipeline, metrics, tracing)
 	telemetryTimeout := time.Second
 	if telemetry != nil {
 		telemetryTimeout = cfg.Observability.Metrics.ShutdownTimeout
@@ -150,6 +140,24 @@ func main() {
 		logger.Error("gateway stopped with an error", "error", runErr)
 		os.Exit(1)
 	}
+}
+
+func newBuildMetrics(pipeline observability.SnapshotSource) *observability.Metrics {
+	return observability.NewMetrics(version, commit, buildTime, pipeline)
+}
+
+func logStartup(logger *slog.Logger, cfg config.Config, eventPipeline *securityevent.Pipeline, metrics *observability.Metrics, tracing *observability.Tracing) {
+	logger.Info("AegisGate initialized",
+		"environment", cfg.Environment,
+		"route_count", len(cfg.Routes),
+		"api_key_count", len(cfg.APIKeys),
+		"rate_limited_route_count", rateLimitedRouteCount(cfg.Routes),
+		"waf_enabled_route_count", wafEnabledRouteCount(cfg.Routes),
+		"security_event_pipeline_enabled", eventPipeline != nil,
+		"metrics_enabled", metrics != nil,
+		"tracing_enabled", tracing != nil,
+		"version", version, "commit", commit, "build_time", buildTime,
+	)
 }
 
 func shutdownTracing(tracing *observability.Tracing, options *observability.Options, logger *slog.Logger) {

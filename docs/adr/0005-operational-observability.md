@@ -34,6 +34,13 @@ upstream client span is created in the transport. The transport injects only
 traceparent/tracestate, deleting baggage. Route-pattern span names avoid raw
 paths. Disabled tracing has no exporter or background worker.
 
+The proxy always removes client-supplied trace headers during rewriting,
+including when tracing is disabled. With tracing enabled, the transport then
+injects the active span identity but discards client-controlled tracestate;
+it never forwards baggage. Docker build
+metadata is bounded and supplied as static build arguments, not derived from
+runtime requests.
+
 Request metrics use the one existing route match. Route IDs are validated
 configuration values; methods, status classes, outcomes, decisions, modes,
 actions, and transport results are finite enums. No request/trace IDs, URLs,

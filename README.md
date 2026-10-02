@@ -455,6 +455,22 @@ config binds metrics to `127.0.0.1:9090`; point tracing at an OTLP HTTP
 Collector origin and choose a sampling ratio. The Compose stack is a local
 demonstration, not hardened or durable production telemetry.
 
+For a review image with static, non-secret build metadata:
+
+```bash
+docker build -f deployments/docker/Dockerfile --target gateway \
+  --build-arg VERSION=v0.7.0-rc1 \
+  --build-arg COMMIT=abc123def456 \
+  --build-arg BUILD_TIME=2026-10-02T12:00:00Z \
+  -t aegisgate:review .
+```
+
+Compose accepts `AEGIS_BUILD_VERSION`, `AEGIS_BUILD_COMMIT`, and
+`AEGIS_BUILD_TIME` for gateway images; defaults are `dev`, `unknown`, and
+`unknown`. Values must be 1–64 safe ASCII characters and must not contain
+secrets. They appear in startup logs and `aegisgate_build_info`, fixed for the
+image lifetime rather than derived from requests.
+
 Metric labels are limited to validated route IDs and fixed enums; never add
 raw paths, credentials, client identities, IP addresses, request/trace IDs, or
 error strings. Traces exclude bodies, query strings, and WAF evidence and do

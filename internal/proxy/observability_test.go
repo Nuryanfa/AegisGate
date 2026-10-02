@@ -125,6 +125,90 @@ func TestProxyObservabilityAndPolicyClassification(t *testing.T) {
 	}
 }
 
+func TestProxySanitizesTraceAndSecurityHeadersWithTracingDisabledOrEnabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		name := "disabled"
+		if enabled {
+			name = "enabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			observed := make(chan http.Header, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				observed <- r.Header.Clone()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+			var tracing *observability.Tracing
+			if enabled {
+				options := observability.Options{ServiceName: "aegisgate", Environment: "test", Tracing: observability.TracingOptions{
+					Enabled: true, Endpoint: "http://localhost:4318", SampleRatio: 1,
+					ExportTimeout: time.Second, BatchTimeout: time.Second, MaxQueueSize: 32,
+					MaxExportBatchSize: 8, ShutdownTimeout: time.Second,
+				}}
+				var err error
+				tracing, err = observability.NewTracing(context.Background(), options, "test", tracetest.NewInMemoryExporter())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tracing.Shutdown(context.Background())
+			}
+			handler, err := NewWithObservability([]router.Route{publicRoute(t, "users", "/api/users", upstream.URL, time.Second)}, emptyRegistry(t), nil, nil, nil, nil, tracing, discardLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapped := middleware.RequestID(observability.Middleware(tracing, nil, handler))
+			request := httptest.NewRequest(http.MethodGet, "http://gateway.local/api/users/42", nil)
+			request.RemoteAddr = "203.0.113.2:4321"
+			inboundParent := "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+			request.Header.Set("traceparent", inboundParent)
+			request.Header.Set("tracestate", "vendor=example")
+			request.Header.Set("baggage", "secret=arbitrary-client-value")
+			request.Header.Set("X-Forwarded-For", "198.51.100.99")
+			request.Header.Set("Forwarded", "for=198.51.100.99")
+			request.Header.Set("X-Real-IP", "198.51.100.99")
+			request.Header.Set("X-API-Key", "credential")
+			request.Header.Set("X-Aegis-Client-ID", "spoofed")
+			response := httptest.NewRecorder()
+			wrapped.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatal(response.Code)
+			}
+			var header http.Header
+			select {
+			case header = <-observed:
+			default:
+				t.Fatal("upstream not reached")
+			}
+			for _, key := range []string{"baggage", "Forwarded", "X-Real-IP", "X-API-Key", "X-Aegis-Client-ID"} {
+				if got := header.Get(key); got != "" {
+					t.Fatalf("%s leaked: %q", key, got)
+				}
+			}
+			if got := header.Get("X-Forwarded-For"); got != "203.0.113.2" {
+				t.Fatalf("forwarded peer = %q", got)
+			}
+			if got := header.Get(middleware.RequestIDHeader); got == "" {
+				t.Fatal("request ID missing")
+			}
+			if !enabled {
+				for _, key := range []string{"traceparent", "tracestate"} {
+					if got := header.Get(key); got != "" {
+						t.Fatalf("%s leaked with tracing off: %q", key, got)
+					}
+				}
+				return
+			}
+			outboundParent := header.Get("traceparent")
+			if outboundParent == "" || outboundParent == inboundParent || !strings.Contains(outboundParent, "0123456789abcdef0123456789abcdef") {
+				t.Fatalf("invalid AegisGate-controlled traceparent: %q", outboundParent)
+			}
+			if got := header.Get("tracestate"); got != "" {
+				t.Fatalf("client tracestate leaked: %q", got)
+			}
+		})
+	}
+}
+
 func TestProxyObservabilityRecordsUpstreamFailure(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	address := upstream.URL

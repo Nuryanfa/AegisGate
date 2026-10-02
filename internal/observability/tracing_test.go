@@ -58,7 +58,7 @@ func TestTracingInboundPropagationRouteAndDecisions(t *testing.T) {
 	upstreamCtx, upstreamSpan := tracing.StartUpstream(ctx, "users", "users-upstream")
 	upstreamHeader := http.Header{"Baggage": []string{"password=do-not-export"}}
 	tracing.Inject(upstreamCtx, upstreamHeader)
-	if upstreamHeader.Get("traceparent") == "" || upstreamHeader.Get("baggage") != "" {
+	if upstreamHeader.Get("traceparent") == "" || upstreamHeader.Get("baggage") != "" || upstreamHeader.Get("tracestate") != "" {
 		t.Fatal(upstreamHeader)
 	}
 	upstreamSpan.End()

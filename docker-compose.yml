@@ -4,6 +4,10 @@ services:
       context: .
       dockerfile: deployments/docker/Dockerfile
       target: gateway
+      args:
+        VERSION: ${AEGIS_BUILD_VERSION:-dev}
+        COMMIT: ${AEGIS_BUILD_COMMIT:-unknown}
+        BUILD_TIME: ${AEGIS_BUILD_TIME:-unknown}
     environment:
       AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
       AEGIS_REDIS_USERNAME: ${AEGIS_REDIS_USERNAME:-}
@@ -28,6 +32,10 @@ services:
       context: .
       dockerfile: deployments/docker/Dockerfile
       target: gateway
+      args:
+        VERSION: ${AEGIS_BUILD_VERSION:-dev}
+        COMMIT: ${AEGIS_BUILD_COMMIT:-unknown}
+        BUILD_TIME: ${AEGIS_BUILD_TIME:-unknown}
     environment:
       AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
       AEGIS_REDIS_USERNAME: ${AEGIS_REDIS_USERNAME:-}

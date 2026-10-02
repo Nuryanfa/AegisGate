@@ -35,6 +35,10 @@ production deployment. Without the profile, the gateway still runs, though
 the Docker example's enabled tracer cannot reach its Collector; use a local
 override config with tracing disabled to avoid export warnings.
 If 8080 is occupied, set `AEGIS_GATEWAY_PORT=18080` and use that host port.
+Compose passes optional `AEGIS_BUILD_VERSION`, `AEGIS_BUILD_COMMIT`, and
+`AEGIS_BUILD_TIME` to the gateway build; each is checked as a bounded,
+non-secret static value (1–64 safe ASCII characters). See the Docker build
+example in the README. The default image reports `dev`/`unknown`/`unknown`.
 
 For a protected-route demo, replace the placeholder digest in a gitignored
 `configs/local.yaml`, provide its path via `AEGIS_CONFIG_FILE`, and keep the
@@ -79,8 +83,12 @@ deployment. Build-info labels change only when the process is rebuilt.
 
 The server span is named for a configured route pattern, with `gateway.request`
 for unmatched paths. Rate-limit and WAF spans are internal; upstream requests
-produce one client span and receive W3C trace context. Invalid inbound context
-is ignored; arbitrary baggage is removed. Only bounded route/policy/status
+produce one client span and receive W3C trace context. Client-supplied
+`traceparent`, `tracestate`, and `baggage` are stripped from the proxy request
+even when tracing is disabled. When enabled, the gateway injects the current
+span's trace identity after stripping, without relaying client-controlled
+tracestate entries. Invalid inbound context is ignored; arbitrary baggage is
+removed. Only bounded route/policy/status
 attributes and configured upstream hostname are recorded. A sampled request's
 completion log adds `trace_id` and `span_id`; no trace ID is a metric label.
 The existing completion log still includes path and direct peer address from

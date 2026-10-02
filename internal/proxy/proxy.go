@@ -353,11 +353,11 @@ func reverseProxy(upstream *url.URL, routeID string, metrics *observability.Metr
 			}
 			request.Out.Header.Del("Forwarded")
 			request.Out.Header.Del("X-Real-IP")
-			if tracing != nil && tracing.Enabled() {
-				request.Out.Header.Del("traceparent")
-				request.Out.Header.Del("tracestate")
-				request.Out.Header.Del("baggage")
-			}
+			// Never pass client-supplied trace headers through unchanged. The
+			// observed transport injects the current context only when enabled.
+			request.Out.Header.Del("traceparent")
+			request.Out.Header.Del("tracestate")
+			request.Out.Header.Del("baggage")
 			request.SetXForwarded()
 			request.Out.Header.Set(middleware.RequestIDHeader, middleware.RequestIDFromContext(request.In.Context()))
 		},

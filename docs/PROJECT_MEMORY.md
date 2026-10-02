@@ -268,3 +268,6 @@ These must be confirmed before repository scaffolding hardens them:
   read-only v0.6 pipeline snapshot collection, and OpenTelemetry traces via
   bounded OTLP HTTP batching and W3C propagation. Telemetry exporter failure
   does not change security decisions or readiness. ADR 0005 records the scope.
+- 2026-10-02: v0.7 review hardening: remove raw trace headers unconditionally
+  before proxying, inject active trace context only when tracing is enabled,
+  and pass bounded static build metadata into Docker gateway images.

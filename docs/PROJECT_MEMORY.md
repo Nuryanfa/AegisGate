@@ -262,3 +262,12 @@ These must be confirmed before repository scaffolding hardens them:
   `feature/v0.6-security-event-pipeline`. Selected bounded drop-newest ingress,
   a single-owner detector, bounded delivery with fixed workers, and a timed
   allowlisted slog sink; recorded the decision in ADR 0004.
+- 2026-10-02: `v0.6.0` is released on `main`; fast-forwarded `develop` to the
+  release and began v0.7 on `feature/v0.7-observability`. Selected native
+  Prometheus pull metrics with a private registry and separate listener,
+  read-only v0.6 pipeline snapshot collection, and OpenTelemetry traces via
+  bounded OTLP HTTP batching and W3C propagation. Telemetry exporter failure
+  does not change security decisions or readiness. ADR 0005 records the scope.
+- 2026-10-02: v0.7 review hardening: remove raw trace headers unconditionally
+  before proxying, inject active trace context only when tracing is enabled,
+  and pass bounded static build metadata into Docker gateway images.

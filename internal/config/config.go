@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Nuryanfa/AegisGate/internal/auth"
+	"github.com/Nuryanfa/AegisGate/internal/observability"
 	"github.com/Nuryanfa/AegisGate/internal/ratelimit"
 	"github.com/Nuryanfa/AegisGate/internal/router"
 	"github.com/Nuryanfa/AegisGate/internal/securityevent"
@@ -45,6 +46,7 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	Redis           *RedisConfig
 	SecurityEvents  *securityevent.Options
+	Observability   *observability.Options
 	APIKeys         []auth.Key
 	Routes          []router.Route
 }
@@ -53,6 +55,7 @@ type fileConfig struct {
 	Server         fileServer          `yaml:"server"`
 	Redis          *fileRedis          `yaml:"redis"`
 	SecurityEvents *fileSecurityEvents `yaml:"security_events"`
+	Observability  *fileObservability  `yaml:"observability"`
 	APIKeys        []fileAPIKey        `yaml:"api_keys"`
 	Routes         []fileRoute         `yaml:"routes"`
 }
@@ -320,6 +323,13 @@ func build(raw fileConfig) (Config, error) {
 		cfg.SecurityEvents = &options
 	} else if raw.SecurityEvents != nil {
 		return Config{}, errors.New("security_events configuration is unused because no route enables WAF inspection")
+	}
+	if raw.Observability != nil {
+		options, err := parseObservability(*raw.Observability)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Observability = &options
 	}
 
 	return cfg, nil

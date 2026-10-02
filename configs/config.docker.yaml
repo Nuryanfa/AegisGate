@@ -30,6 +30,27 @@ security_events:
     cooldown: 1m
     max_keys: 4096
 
+# Telemetry binds only inside the Compose network; port 9090 is not published.
+observability:
+  service_name: aegisgate
+  environment: development
+  metrics:
+    enabled: true
+    address: "0.0.0.0:9090"
+    path: /metrics
+    read_timeout: 5s
+    write_timeout: 10s
+    shutdown_timeout: 5s
+  tracing:
+    enabled: true
+    endpoint: "http://otel-collector:4318"
+    sample_ratio: 1.0
+    export_timeout: 2s
+    batch_timeout: 5s
+    max_queue_size: 2048
+    max_export_batch_size: 512
+    shutdown_timeout: 5s
+
 # Non-working placeholders; use a gitignored local config for real demo keys.
 api_keys:
   - id: orders-client

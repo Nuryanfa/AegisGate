@@ -69,7 +69,9 @@ type Store struct {
 	startupPolicy, stalePolicy string
 	staleAfter                 time.Duration
 	started                    time.Time
+	now                        func() time.Time
 	lastSuccess                atomic.Int64
+	lastContact                atomic.Int64
 	remote                     atomic.Bool
 	connected                  atomic.Bool
 	metrics                    *observability.ControlPlaneMetrics
@@ -78,7 +80,7 @@ type Store struct {
 func (s *Store) SetMetrics(metrics *observability.ControlPlaneMetrics) { s.metrics = metrics }
 
 func NewStore(initial *Runtime, compiler Compiler, settings *config.ControlPlaneConfig) *Store {
-	s := &Store{compiler: compiler, started: time.Now()}
+	s := &Store{compiler: compiler, started: time.Now(), now: time.Now}
 	s.active.Store(initial)
 	if settings != nil {
 		s.startupPolicy = settings.StartupPolicy
@@ -92,6 +94,22 @@ func (s *Store) Active() *Runtime        { return s.active.Load() }
 func (s *Store) SetConnected(value bool) { s.connected.Store(value) }
 func (s *Store) Connected() bool         { return s.connected.Load() }
 func (s *Store) RemoteApplied() bool     { return s.remote.Load() }
+
+// RecordContact records a valid message on the configured control-plane stream.
+// The peer is authenticated when mTLS is enabled; development plaintext is not.
+// A live stream alone does not prove that its peer remains responsive.
+func (s *Store) RecordContact() {
+	now := s.now().UnixNano()
+	for {
+		previous := s.lastContact.Load()
+		if now <= previous || s.lastContact.CompareAndSwap(previous, now) {
+			break
+		}
+	}
+	if s.metrics != nil {
+		s.metrics.LastContact.Set(float64(s.lastContact.Load()) / float64(time.Second))
+	}
+}
 func (s *Store) Ready() bool {
 	if s.startupPolicy == "require_remote" && !s.remote.Load() {
 		return false
@@ -106,10 +124,10 @@ func (s *Store) Stale() bool {
 		return false
 	}
 	last := s.started
-	if ts := s.lastSuccess.Load(); ts > 0 {
+	if ts := s.lastContact.Load(); ts > 0 {
 		last = time.Unix(0, ts)
 	}
-	stale := time.Since(last) > s.staleAfter
+	stale := s.now().Sub(last) > s.staleAfter
 	if s.metrics != nil {
 		if stale {
 			s.metrics.Stale.Set(1)
@@ -129,7 +147,8 @@ func (s *Store) ApplyContext(ctx context.Context, d config.Dynamic, revision str
 	defer s.mu.Unlock()
 	if current := s.active.Load(); current != nil && current.Revision == revision {
 		s.remote.Store(true)
-		s.lastSuccess.Store(time.Now().UnixNano())
+		s.lastSuccess.Store(s.now().UnixNano())
+		s.RecordContact()
 		return false, nil
 	}
 	var compileSpan trace.Span
@@ -152,7 +171,8 @@ func (s *Store) ApplyContext(ctx context.Context, d config.Dynamic, revision str
 		applySpan.End()
 	}
 	s.remote.Store(true)
-	s.lastSuccess.Store(time.Now().UnixNano())
+	s.lastSuccess.Store(s.now().UnixNano())
+	s.RecordContact()
 	return true, nil
 }
 

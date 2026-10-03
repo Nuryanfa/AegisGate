@@ -2,7 +2,7 @@
 
 AegisGate is a portfolio-grade API gateway and security platform written in
 Go. v0.7 adds Prometheus metrics and OpenTelemetry tracing to the v0.6
-security-event gateway on the feature branch.
+security-event gateway.
 
 This is an educational, production-like project, not a claim of production
 readiness. An API key identifies a calling application, not a human user.
@@ -10,7 +10,7 @@ readiness. An API key identifies a calling application, not a human user.
 ## Capabilities
 
 - Standard-library HTTP server and reverse proxy
-- Strict, startup-only YAML configuration
+- Strict YAML bootstrap configuration; atomic remote updates in control-plane mode
 - Boundary-aware longest-prefix routing and per-route deadlines
 - Explicit public or API-key-protected routes
 - SHA-256-only key registry with all-required scope authorization
@@ -124,8 +124,10 @@ are rejected.
 
 Only a SHA-256 digest belongs in configuration. Key IDs, digests, route IDs,
 prefixes, and scopes are validated; duplicates and unknown YAML fields fail
-startup. A protected route is invalid when `api_keys` is empty. Configuration,
-rotation, and revocation are restart-only; hot reload is not implemented.
+startup. A protected route is invalid when `api_keys` is empty. Without
+`control_plane`, configuration, rotation, and revocation require a restart.
+In control-plane mode, validated remote snapshots update routes, policies,
+and API clients atomically; node-local settings still require a restart.
 
 ### Rate-limit semantics
 
@@ -459,7 +461,7 @@ For a review image with static, non-secret build metadata:
 
 ```bash
 docker build -f deployments/docker/Dockerfile --target gateway \
-  --build-arg VERSION=v0.7.0-rc1 \
+  --build-arg VERSION=v0.7.0 \
   --build-arg COMMIT=abc123def456 \
   --build-arg BUILD_TIME=2026-10-02T12:00:00Z \
   -t aegisgate:review .
@@ -488,6 +490,11 @@ revisions, ACK/NACK delivery, mTLS support, and atomic runtime swaps. Local
 routes and API clients remain the bootstrap snapshot; listeners, Redis secrets,
 TLS keys, and telemetry remain node-local. The checked-in Compose demo uses
 **insecure development-only gRPC**; production requires mTLS.
+Valid snapshots and heartbeats refresh the last contact time (peer-authenticated
+with mTLS, but not in the insecure development demo).
+With `stale_policy: deny`, the gateway returns `503 CONFIG_STALE` only after
+`stale_after` without valid contact; `serve` retains the last-known-good
+runtime. `stale_after` must be at least 1m (twice the 30s heartbeat interval).
 
 ```bash
 docker compose --profile control-plane-demo up --build control-plane gateway-cp-a gateway-cp-b users-upstream orders-upstream
@@ -514,7 +521,7 @@ start from `develop`. Promote milestones only after validation and review.
 | v0.4 | Redis-backed distributed rate limiting | Released (`v0.4.0`) |
 | v0.5 | Bounded request inspection and WAF rules | Released (`v0.5.0`) |
 | v0.6 | Asynchronous security events and process-local detection | Released (`v0.6.0`) |
-| v0.7 | Metrics, tracing, and operational observability | Implemented on `feature/v0.7-observability`, pending review |
+| v0.7 | Metrics, tracing, and operational observability | Released (`v0.7.0`) |
 | v0.8 | gRPC control plane and distributed configuration | Implemented on `feature/v0.8-grpc-control-plane`, pending review |
 
 ## License

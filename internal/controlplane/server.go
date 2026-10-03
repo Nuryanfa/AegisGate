@@ -128,11 +128,6 @@ func (s *Server) Reload(path string) (bool, error) {
 }
 
 func (s *Server) Sync(stream cpb.ConfigurationService_SyncServer) error {
-	if s.tracing != nil && s.tracing.Enabled() {
-		var span trace.Span
-		_, span = s.tracing.StartCheck(stream.Context(), "control_plane.sync")
-		defer span.End()
-	}
 	first, err := stream.Recv()
 	if err != nil {
 		if status.Code(err) == codes.ResourceExhausted {
@@ -185,7 +180,7 @@ func (s *Server) Sync(stream cpb.ConfigurationService_SyncServer) error {
 	}()
 	var sequence uint64
 	sent := make(map[uint64]string)
-	heartbeat := time.NewTicker(30 * time.Second)
+	heartbeat := time.NewTicker(config.ControlPlaneHeartbeatInterval)
 	defer heartbeat.Stop()
 	for {
 		select {

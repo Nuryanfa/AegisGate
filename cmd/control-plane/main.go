@@ -52,6 +52,14 @@ func main() {
 	cpMetrics := observability.NewControlPlaneMetrics(registry)
 	service.SetMetrics(cpMetrics)
 	var tracing *observability.Tracing
+	shutdownTracing := func() {
+		if tracing == nil {
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracing.Shutdown(shutdownCtx)
+	}
 	if settings.TracingEndpoint != "" {
 		traceOptions := observability.Options{ServiceName: "aegisgate-control-plane", Environment: settings.Environment, Tracing: observability.TracingOptions{Enabled: true, Endpoint: settings.TracingEndpoint, SampleRatio: 1, ExportTimeout: 2 * time.Second, BatchTimeout: 5 * time.Second, MaxQueueSize: 2048, MaxExportBatchSize: 512, ShutdownTimeout: 5 * time.Second}}
 		if err := traceOptions.Validate(); err != nil {
@@ -64,27 +72,28 @@ func main() {
 			os.Exit(1)
 		}
 		service.SetTracing(tracing)
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = tracing.Shutdown(shutdownCtx)
-		}()
+		defer shutdownTracing()
 	}
 	var metricsServer *http.Server
+	var metricsServeErr <-chan error
 	if settings.MetricsAddress != "" {
 		metricsListener, err := net.Listen("tcp", settings.MetricsAddress)
 		if err != nil {
 			logger.Error("metrics listener unavailable", "reason", "dependency")
+			shutdownTracing()
 			os.Exit(1)
 		}
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 		metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
-		go metricsServer.Serve(metricsListener)
+		errors := make(chan error, 1)
+		metricsServeErr = errors
+		go func() { errors <- metricsServer.Serve(metricsListener) }()
 	}
 	listener, err := net.Listen("tcp", settings.Address)
 	if err != nil {
 		logger.Error("control-plane listener unavailable", "reason", "dependency")
+		shutdownTracing()
 		os.Exit(1)
 	}
 	options := []grpc.ServerOption{
@@ -92,10 +101,14 @@ func main() {
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 15 * time.Second, PermitWithoutStream: false}),
 	}
+	if tracing != nil && tracing.Enabled() {
+		options = append(options, grpc.StatsHandler(tracing.GRPCServerHandler()))
+	}
 	if settings.TLS.Enabled {
 		creds, err := controlplane.ServerCredentials(settings.TLS)
 		if err != nil {
 			logger.Error("invalid TLS credentials", "reason", "validation")
+			shutdownTracing()
 			os.Exit(1)
 		}
 		options = append(options, grpc.Creds(creds))
@@ -132,28 +145,42 @@ func main() {
 				logger.Info("snapshot unchanged", "revision", service.Revision())
 			}
 		case <-ctx.Done():
-			healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-			if metricsServer != nil {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), settings.ShutdownTimeout)
-				_ = metricsServer.Shutdown(shutdownCtx)
-				cancel()
-			}
-			finished := make(chan struct{})
-			go func() { grpcServer.GracefulStop(); close(finished) }()
-			select {
-			case <-finished:
-			case <-time.After(settings.ShutdownTimeout):
-				grpcServer.Stop()
-				<-finished
-			}
+			shutdownServers(grpcServer, metricsServer, healthServer, settings.ShutdownTimeout)
 			logger.Info("control plane stopped")
 			return
+		case err := <-metricsServeErr:
+			if err != nil && err != http.ErrServerClosed {
+				logger.Error("metrics server failed", "reason", "dependency")
+				shutdownServers(grpcServer, metricsServer, healthServer, settings.ShutdownTimeout)
+				shutdownTracing()
+				os.Exit(1)
+			}
+			metricsServeErr = nil
 		case err := <-serveErr:
 			if err != nil {
 				logger.Error("control-plane server failed", "reason", "dependency")
+				shutdownServers(grpcServer, metricsServer, healthServer, settings.ShutdownTimeout)
+				shutdownTracing()
 				os.Exit(1)
 			}
 			return
 		}
+	}
+}
+
+func shutdownServers(grpcServer *grpc.Server, metricsServer *http.Server, healthServer *health.Server, timeout time.Duration) {
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	if metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		_ = metricsServer.Shutdown(ctx)
+		cancel()
+	}
+	finished := make(chan struct{})
+	go func() { grpcServer.GracefulStop(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(timeout):
+		grpcServer.Stop()
+		<-finished
 	}
 }

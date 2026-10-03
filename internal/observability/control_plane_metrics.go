@@ -14,6 +14,7 @@ type ControlPlaneMetrics struct {
 	Apply         *prometheus.CounterVec
 	ApplyDuration prometheus.Histogram
 	LastSuccess   prometheus.Gauge
+	LastContact   prometheus.Gauge
 	Stale         prometheus.Gauge
 	Clients       prometheus.Gauge
 	Published     prometheus.Counter
@@ -30,6 +31,7 @@ func NewControlPlaneMetrics(registry *prometheus.Registry) *ControlPlaneMetrics 
 		Apply:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "aegisgate_control_plane_snapshot_apply_total", Help: "Snapshot application outcomes."}, []string{"result", "reason"}),
 		ApplyDuration: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "aegisgate_control_plane_snapshot_apply_duration_seconds", Help: "Snapshot validation and application duration.", Buckets: latencyBuckets}),
 		LastSuccess:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "aegisgate_control_plane_last_success_timestamp_seconds", Help: "Unix time of last accepted snapshot."}),
+		LastContact:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "aegisgate_control_plane_last_contact_timestamp_seconds", Help: "Unix time of last valid control-plane message (authenticated when mTLS is enabled)."}),
 		Stale:         prometheus.NewGauge(prometheus.GaugeOpts{Name: "aegisgate_control_plane_stale", Help: "Whether configuration is stale."}),
 		Clients:       prometheus.NewGauge(prometheus.GaugeOpts{Name: "aegisgate_control_plane_clients", Help: "Connected gateway streams."}),
 		Published:     prometheus.NewCounter(prometheus.CounterOpts{Name: "aegisgate_control_plane_snapshots_published_total", Help: "Changed snapshots published."}),
@@ -37,7 +39,7 @@ func NewControlPlaneMetrics(registry *prometheus.Registry) *ControlPlaneMetrics 
 		NACKs:         prometheus.NewCounter(prometheus.CounterOpts{Name: "aegisgate_control_plane_nacks_total", Help: "Gateway rejections."}),
 		Reload:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "aegisgate_control_plane_reload_total", Help: "Snapshot reload outcomes."}, []string{"result"}),
 	}
-	registry.MustRegister(m.Connected, m.Reconnects, m.Received, m.Apply, m.ApplyDuration, m.LastSuccess, m.Stale, m.Clients, m.Published, m.ACKs, m.NACKs, m.Reload)
+	registry.MustRegister(m.Connected, m.Reconnects, m.Received, m.Apply, m.ApplyDuration, m.LastSuccess, m.LastContact, m.Stale, m.Clients, m.Published, m.ACKs, m.NACKs, m.Reload)
 	return m
 }
 

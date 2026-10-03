@@ -10,6 +10,9 @@ import (
 
 var instanceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+// ControlPlaneHeartbeatInterval is the authority's outbound heartbeat cadence.
+const ControlPlaneHeartbeatInterval = 30 * time.Second
+
 type ControlPlaneConfig struct {
 	Address, InstanceID, StartupPolicy, StalePolicy string
 	InitialSyncTimeout, StaleAfter, DialTimeout     time.Duration
@@ -97,6 +100,9 @@ func parseControlPlane(raw fileControlPlane, environment string) (*ControlPlaneC
 	}
 	if c.ReconnectMaxBackoff < c.ReconnectMinBackoff {
 		return nil, errors.New("control_plane.reconnect_max_backoff must be >= reconnect_min_backoff")
+	}
+	if c.StaleAfter < 2*ControlPlaneHeartbeatInterval {
+		return nil, errors.New("control_plane.stale_after must be at least twice the 30s heartbeat interval (1m)")
 	}
 	if c.MaxReceiveBytes < 1024 || c.MaxReceiveBytes > 2<<20 {
 		return nil, errors.New("control_plane.max_receive_bytes must be between 1024 and 2097152")

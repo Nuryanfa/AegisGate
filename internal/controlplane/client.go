@@ -39,10 +39,15 @@ func NewClient(settings config.ControlPlaneConfig, store *Store, logger *slog.Lo
 	} else {
 		transport = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
-	dialer := func(ctx context.Context, address string) (*grpc.ClientConn, error) {
-		return grpc.DialContext(ctx, address, transport, grpc.WithBlock(), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(settings.MaxReceiveBytes), grpc.MaxCallSendMsgSize(4096)))
+	c := &Client{settings: settings, store: store, logger: logger}
+	c.dialer = func(ctx context.Context, address string) (*grpc.ClientConn, error) {
+		options := []grpc.DialOption{transport, grpc.WithBlock(), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(settings.MaxReceiveBytes), grpc.MaxCallSendMsgSize(4096))}
+		if c.tracing != nil && c.tracing.Enabled() {
+			options = append(options, grpc.WithStatsHandler(c.tracing.GRPCClientHandler()))
+		}
+		return grpc.DialContext(ctx, address, options...)
 	}
-	return &Client{settings: settings, store: store, logger: logger, dialer: dialer}, nil
+	return c, nil
 }
 
 func (c *Client) Run(ctx context.Context) {
@@ -147,6 +152,7 @@ func (c *Client) connectOnce(parent context.Context) (bool, error) {
 		snapshot := message.GetSnapshot()
 		if snapshot == nil {
 			if message.GetHeartbeat() != nil {
+				c.store.RecordContact()
 				continue
 			}
 			return true, errors.New("unsupported server message")
@@ -186,6 +192,7 @@ func (c *Client) connectOnce(parent context.Context) (bool, error) {
 			}
 			continue
 		}
+		c.store.RecordContact()
 		changed, err := c.store.ApplyContext(streamCtx, dynamic, snapshot.Revision)
 		if err != nil {
 			c.metrics.ObserveApply("rejected", "dependency", time.Since(started))

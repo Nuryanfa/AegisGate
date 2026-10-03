@@ -58,7 +58,7 @@ jobs:
       - name: Check protobuf compatibility when baseline exists
         run: |
           if git cat-file -e origin/main:buf.yaml 2>/dev/null; then
-            buf breaking --against '.git#branch=main'
+            buf breaking --against '.git#branch=origin/main'
           else
             echo 'No protobuf baseline on main yet; breaking check deferred.'
           fi

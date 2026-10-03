@@ -40,6 +40,8 @@ vendor/
 data/
 tmp/
 .tmp-go-cache/
+.tmp-docker-config/
+.tools/
 *.log
 *.pid
 

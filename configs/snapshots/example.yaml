@@ -1,0 +1,19 @@
+# Non-working sample digest. Distribute digests, never plaintext keys.
+api_keys:
+  - id: demo-client
+    sha256: 0000000000000000000000000000000000000000000000000000000000000000
+    scopes: [orders:read]
+routes:
+  - id: users
+    path_prefix: /api/users
+    upstream: http://users-upstream:8081
+    timeout: 5s
+    auth:
+      mode: public
+  - id: orders
+    path_prefix: /api/orders
+    upstream: http://orders-upstream:8081
+    timeout: 8s
+    auth:
+      mode: api_key
+      required_scopes: [orders:read]

@@ -5,14 +5,17 @@ import (
 	"net/http"
 	"strings"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/grpc/stats"
 )
 
 type Tracing struct {
@@ -56,6 +59,22 @@ func NewTracing(ctx context.Context, options Options, version string, exporter s
 
 func (t *Tracing) Enabled() bool { return t != nil && t.enabled }
 
+// GRPCClientHandler and GRPCServerHandler use this process's explicit provider
+// and trace-context propagator, never the global OpenTelemetry configuration.
+func (t *Tracing) GRPCClientHandler() stats.Handler {
+	if !t.Enabled() {
+		return nil
+	}
+	return otelgrpc.NewClientHandler(otelgrpc.WithTracerProvider(t.provider), otelgrpc.WithPropagators(t.propagator), otelgrpc.WithMeterProvider(metricnoop.NewMeterProvider()))
+}
+
+func (t *Tracing) GRPCServerHandler() stats.Handler {
+	if !t.Enabled() {
+		return nil
+	}
+	return otelgrpc.NewServerHandler(otelgrpc.WithTracerProvider(t.provider), otelgrpc.WithPropagators(t.propagator), otelgrpc.WithMeterProvider(metricnoop.NewMeterProvider()))
+}
+
 func (t *Tracing) StartServer(r *http.Request) (context.Context, trace.Span) {
 	ctx := t.propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 	return t.tracer.Start(ctx, "gateway.request", trace.WithSpanKind(trace.SpanKindServer),
@@ -90,6 +109,13 @@ func (t *Tracing) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	return t.sdk.Shutdown(ctx)
+}
+
+func (t *Tracing) ForceFlush(ctx context.Context) error {
+	if t == nil || t.sdk == nil {
+		return nil
+	}
+	return t.sdk.ForceFlush(ctx)
 }
 
 func SetRoute(ctx context.Context, route, pattern string) {

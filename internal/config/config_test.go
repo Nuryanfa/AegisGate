@@ -8,6 +8,23 @@ import (
 	"time"
 )
 
+func TestControlPlaneStaleDeadlineAllowsHeartbeatMargin(t *testing.T) {
+	raw := fileControlPlane{
+		Enabled: true, Address: "localhost:8443", InstanceID: "gateway-a",
+		StartupPolicy: "use_bootstrap", StalePolicy: "deny",
+		InitialSyncTimeout: "10s", StaleAfter: "59s", DialTimeout: "3s",
+		ReconnectMinBackoff: "1s", ReconnectMaxBackoff: "30s",
+		MaxReceiveBytes: 1024, AckQueueCapacity: 1, ShutdownTimeout: "5s",
+	}
+	if _, err := parseControlPlane(raw, "development"); err == nil || !strings.Contains(err.Error(), "heartbeat interval") {
+		t.Fatalf("sub-heartbeat stale deadline accepted: %v", err)
+	}
+	raw.StaleAfter = "1m"
+	if _, err := parseControlPlane(raw, "development"); err != nil {
+		t.Fatalf("two-heartbeat stale deadline rejected: %v", err)
+	}
+}
+
 func TestLoadValidConfigurationAndEnvironmentPrecedence(t *testing.T) {
 	prepareEnvironment(t)
 	path := writeConfig(t, `

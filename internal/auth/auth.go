@@ -95,6 +95,12 @@ func (p Policy) RequiresAPIKey() bool {
 	return p.mode == ModeAPIKey
 }
 
+func (p Policy) Mode() Mode               { return p.mode }
+func (p Policy) RequiredScopes() []string { return append([]string(nil), p.requiredScopes...) }
+func (k Key) ID() string                  { return k.id }
+func (k Key) DigestHex() string           { return hex.EncodeToString(k.digest[:]) }
+func (k Key) Scopes() []string            { return append([]string(nil), k.scopes...) }
+
 func NewKey(id, digestHex string, scopes []string) (Key, error) {
 	if !keyIDPattern.MatchString(id) {
 		return Key{}, errors.New("API key ID must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")

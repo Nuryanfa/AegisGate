@@ -1,0 +1,11 @@
+# Development-only plaintext transport. Production requires mTLS.
+environment: development
+address: "0.0.0.0:8443"
+metrics_address: "0.0.0.0:9092"
+# Optional: tracing_endpoint: "http://otel-collector:4318"
+snapshot_file: "/etc/aegisgate/snapshot.yaml"
+max_clients: 16
+max_message_bytes: 2097152
+shutdown_timeout: 5s
+tls:
+  enabled: false

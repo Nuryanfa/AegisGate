@@ -471,7 +471,8 @@ Compose accepts `AEGIS_BUILD_VERSION`, `AEGIS_BUILD_COMMIT`, and
 secrets. They appear in startup logs and `aegisgate_build_info`, fixed for the
 image lifetime rather than derived from requests.
 
-Metric labels are limited to validated route IDs and fixed enums; never add
+Metric labels admit at most 64 validated route IDs per process and otherwise use
+`_other`; never add
 raw paths, credentials, client identities, IP addresses, request/trace IDs, or
 error strings. Traces exclude bodies, query strings, and WAF evidence and do
 not forward arbitrary baggage. Existing v0.6 access logs still include path
@@ -479,6 +480,26 @@ and direct peer address; protect log retention accordingly. Exporter outages
 do not affect HTTP authorization or readiness, but buffered spans can be lost.
 See [operations](docs/observability.md), [illustrative SLIs/SLOs](docs/observability/slis-slos.md),
 and [ADR 0005](docs/adr/0005-operational-observability.md).
+
+## v0.8 control-plane demonstration
+
+The feature branch adds a typed gRPC configuration stream, canonical SHA-256
+revisions, ACK/NACK delivery, mTLS support, and atomic runtime swaps. Local
+routes and API clients remain the bootstrap snapshot; listeners, Redis secrets,
+TLS keys, and telemetry remain node-local. The checked-in Compose demo uses
+**insecure development-only gRPC**; production requires mTLS.
+
+```bash
+docker compose --profile control-plane-demo up --build control-plane gateway-cp-a gateway-cp-b users-upstream orders-upstream
+curl http://127.0.0.1:8084/api/users
+curl http://127.0.0.1:8085/api/users
+```
+
+Edit `configs/snapshots/example.yaml` and run
+`docker compose kill -s HUP control-plane` to distribute a new revision.
+See [the control-plane guide](docs/control-plane.md) and
+[ADR 0006](docs/adr/0006-grpc-control-plane.md) for startup/stale policies,
+TLS setup, backpressure, failure recovery, and limitations.
 
 ## Workflow and roadmap
 
@@ -494,7 +515,7 @@ start from `develop`. Promote milestones only after validation and review.
 | v0.5 | Bounded request inspection and WAF rules | Released (`v0.5.0`) |
 | v0.6 | Asynchronous security events and process-local detection | Released (`v0.6.0`) |
 | v0.7 | Metrics, tracing, and operational observability | Implemented on `feature/v0.7-observability`, pending review |
-| v0.8 | gRPC control plane and distributed configuration | Planned |
+| v0.8 | gRPC control plane and distributed configuration | Implemented on `feature/v0.8-grpc-control-plane`, pending review |
 
 ## License
 

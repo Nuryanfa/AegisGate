@@ -3,6 +3,7 @@ package observability
 import (
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Nuryanfa/AegisGate/internal/securityevent"
@@ -31,6 +32,8 @@ var latencyBuckets = []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1
 type SnapshotSource interface{ Snapshot() securityevent.Snapshot }
 
 type Metrics struct {
+	routeMu          sync.Mutex
+	admittedRoutes   map[string]struct{}
 	registry         *prometheus.Registry
 	requests         *prometheus.CounterVec
 	requestDuration  *prometheus.HistogramVec
@@ -46,7 +49,7 @@ type Metrics struct {
 
 func NewMetrics(version, commit, buildTime string, pipeline SnapshotSource) *Metrics {
 	r := prometheus.NewRegistry()
-	m := &Metrics{registry: r,
+	m := &Metrics{registry: r, admittedRoutes: make(map[string]struct{}),
 		requests:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "aegisgate_http_requests_total", Help: "Completed gateway HTTP requests."}, []string{"route_id", "method", "status_class", "outcome"}),
 		requestDuration:  prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "aegisgate_http_request_duration_seconds", Help: "Gateway request duration through response completion.", Buckets: latencyBuckets}, []string{"route_id", "method", "outcome"}),
 		inFlight:         prometheus.NewGauge(prometheus.GaugeOpts{Name: "aegisgate_http_requests_in_flight", Help: "Active gateway HTTP requests."}),
@@ -88,7 +91,7 @@ func (m *Metrics) EndRequest(route, method, outcome string, status int, duration
 		return
 	}
 	m.inFlight.Dec()
-	route = metricRoute(route)
+	route = m.routeLabel(route)
 	method = metricMethod(method)
 	outcome = metricOutcome(outcome)
 	m.requests.WithLabelValues(route, method, statusClass(status), outcome).Inc()
@@ -101,8 +104,9 @@ func (m *Metrics) ObserveUpstream(route, result string, duration time.Duration) 
 	if result != "success" && result != "timeout" {
 		result = "error"
 	}
-	m.upstream.WithLabelValues(metricRoute(route), result).Inc()
-	m.upstreamDuration.WithLabelValues(metricRoute(route), result).Observe(duration.Seconds())
+	route = m.routeLabel(route)
+	m.upstream.WithLabelValues(route, result).Inc()
+	m.upstreamDuration.WithLabelValues(route, result).Observe(duration.Seconds())
 }
 func (m *Metrics) ObserveAuth(route, decision string) {
 	if m == nil {
@@ -113,7 +117,7 @@ func (m *Metrics) ObserveAuth(route, decision string) {
 	default:
 		decision = "unauthorized"
 	}
-	m.auth.WithLabelValues(metricRoute(route), decision).Inc()
+	m.auth.WithLabelValues(m.routeLabel(route), decision).Inc()
 }
 func (m *Metrics) ObserveRate(route, decision string, duration time.Duration) {
 	if m == nil {
@@ -124,7 +128,7 @@ func (m *Metrics) ObserveRate(route, decision string, duration time.Duration) {
 	default:
 		decision = "dependency_deny"
 	}
-	route = metricRoute(route)
+	route = m.routeLabel(route)
 	m.rate.WithLabelValues(route, decision).Inc()
 	m.rateDuration.WithLabelValues(route).Observe(duration.Seconds())
 }
@@ -140,7 +144,7 @@ func (m *Metrics) ObserveWAF(route, mode, action string, duration time.Duration)
 	default:
 		action = "reject"
 	}
-	route = metricRoute(route)
+	route = m.routeLabel(route)
 	m.waf.WithLabelValues(route, mode, action).Inc()
 	m.wafDuration.WithLabelValues(route).Observe(duration.Seconds())
 }
@@ -148,6 +152,24 @@ func metricRoute(route string) string {
 	if route == "" {
 		return "_none"
 	}
+	return route
+}
+
+// A process admits at most 64 distinct route IDs across all reloads. Additional
+// routes share _other, so repeated configuration churn cannot grow series forever.
+func (m *Metrics) routeLabel(route string) string {
+	if route == "" {
+		return "_none"
+	}
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	if _, ok := m.admittedRoutes[route]; ok {
+		return route
+	}
+	if len(m.admittedRoutes) >= 64 {
+		return "_other"
+	}
+	m.admittedRoutes[route] = struct{}{}
 	return route
 }
 func metricMethod(method string) string {

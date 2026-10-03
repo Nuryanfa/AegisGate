@@ -16,6 +16,7 @@ RUN set -eu; \
       case "$value" in ''|*[!A-Za-z0-9._:+-]*) echo "build metadata contains unsupported characters" >&2; exit 1;; esac; \
     done; \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.buildTime=$BUILD_TIME" -o /out/gateway ./cmd/gateway \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/control-plane ./cmd/control-plane \
     && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/example-upstream ./cmd/example-upstream
 
 FROM gcr.io/distroless/static-debian12:nonroot AS gateway
@@ -25,6 +26,13 @@ COPY --from=builder --chown=nonroot:nonroot /out/gateway /app/gateway
 USER nonroot:nonroot
 EXPOSE 8080
 ENTRYPOINT ["/app/gateway"]
+
+FROM gcr.io/distroless/static-debian12:nonroot AS control-plane
+WORKDIR /app
+COPY --from=builder --chown=nonroot:nonroot /out/control-plane /app/control-plane
+USER nonroot:nonroot
+EXPOSE 8443 9092
+ENTRYPOINT ["/app/control-plane"]
 
 FROM gcr.io/distroless/static-debian12:nonroot AS example-upstream
 

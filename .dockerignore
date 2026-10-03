@@ -2,6 +2,9 @@
 .github
 .agents
 .codex
+.tools
+.tmp-go-cache
+.tmp-docker-config
 .claude
 AGENT.md
 AGENTS.md

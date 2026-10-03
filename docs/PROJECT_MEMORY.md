@@ -284,4 +284,7 @@ These must be confirmed before repository scaffolding hardens them:
   snapshot or heartbeat, independently of the last accepted snapshot time.
   Enforced a minimum 1m stale deadline for the 30s heartbeat cadence, added
   explicit gRPC TraceContext transport instrumentation, and finalized the
-  v0.7 release wording in the README. v0.8 remains pending review.
+  v0.7 release wording in the README.
+- 2026-10-03: Released AegisGate v0.8.0 on `main` with the single-authority
+  gRPC control plane, atomic gateway runtime publication, mTLS contract,
+  freshness-aware heartbeat handling, and transport-level trace propagation.

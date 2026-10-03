@@ -47,6 +47,7 @@ type Config struct {
 	Redis           *RedisConfig
 	SecurityEvents  *securityevent.Options
 	Observability   *observability.Options
+	ControlPlane    *ControlPlaneConfig
 	APIKeys         []auth.Key
 	Routes          []router.Route
 }
@@ -56,6 +57,7 @@ type fileConfig struct {
 	Redis          *fileRedis          `yaml:"redis"`
 	SecurityEvents *fileSecurityEvents `yaml:"security_events"`
 	Observability  *fileObservability  `yaml:"observability"`
+	ControlPlane   *fileControlPlane   `yaml:"control_plane"`
 	APIKeys        []fileAPIKey        `yaml:"api_keys"`
 	Routes         []fileRoute         `yaml:"routes"`
 }
@@ -180,6 +182,9 @@ func Load() (Config, error) {
 	if err := applyEnvironment(&cfg); err != nil {
 		return Config{}, err
 	}
+	if cfg.ControlPlane != nil && cfg.Environment == "production" && !cfg.ControlPlane.TLS.Enabled {
+		return Config{}, errors.New("control_plane.tls must be enabled in production")
+	}
 	if err := validateTimeoutRelationships(cfg); err != nil {
 		return Config{}, err
 	}
@@ -302,7 +307,9 @@ func build(raw fileConfig) (Config, error) {
 		return Config{}, errors.New("redis configuration is required when any route enables rate limiting")
 	}
 	if !hasRateLimit && cfg.Redis != nil {
-		return Config{}, errors.New("redis configuration is unused because no route enables rate limiting")
+		if raw.ControlPlane == nil || !raw.ControlPlane.Enabled {
+			return Config{}, errors.New("redis configuration is unused because no route enables rate limiting")
+		}
 	}
 	hasWAF := false
 	for _, route := range cfg.Routes {
@@ -321,8 +328,14 @@ func build(raw fileConfig) (Config, error) {
 			options = parsed
 		}
 		cfg.SecurityEvents = &options
-	} else if raw.SecurityEvents != nil {
+	} else if raw.SecurityEvents != nil && (raw.ControlPlane == nil || !raw.ControlPlane.Enabled) {
 		return Config{}, errors.New("security_events configuration is unused because no route enables WAF inspection")
+	} else if raw.SecurityEvents != nil {
+		options, err := parseSecurityEvents(*raw.SecurityEvents)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.SecurityEvents = &options
 	}
 	if raw.Observability != nil {
 		options, err := parseObservability(*raw.Observability)
@@ -330,6 +343,13 @@ func build(raw fileConfig) (Config, error) {
 			return Config{}, err
 		}
 		cfg.Observability = &options
+	}
+	if raw.ControlPlane != nil {
+		cp, err := parseControlPlane(*raw.ControlPlane, cfg.Environment)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ControlPlane = cp
 	}
 
 	return cfg, nil
@@ -533,6 +553,15 @@ func validateTimeoutRelationships(cfg Config) error {
 }
 
 func applyEnvironment(cfg *Config) error {
+	if value, ok := os.LookupEnv("AEGIS_CONTROL_PLANE_INSTANCE_ID"); ok {
+		if cfg.ControlPlane == nil {
+			return errors.New("AEGIS_CONTROL_PLANE_INSTANCE_ID requires control_plane")
+		}
+		if !instanceIDPattern.MatchString(value) {
+			return errors.New("AEGIS_CONTROL_PLANE_INSTANCE_ID is invalid")
+		}
+		cfg.ControlPlane.InstanceID = value
+	}
 	if value, ok := os.LookupEnv("AEGIS_ENV"); ok {
 		if strings.TrimSpace(value) == "" {
 			return errors.New("AEGIS_ENV must not be empty")

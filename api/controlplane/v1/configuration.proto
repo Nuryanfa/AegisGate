@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package controlplane.v1;
+
+option go_package = "github.com/Nuryanfa/AegisGate/api/controlplane/v1;controlplanev1";
+
+import "google/protobuf/timestamp.proto";
+
+service ConfigurationService {
+  rpc Sync(stream SyncRequest) returns (stream SyncResponse);
+}
+
+message SyncRequest {
+  oneof payload {
+    Registration registration = 1;
+    Acknowledgement ack = 2;
+    Rejection nack = 3;
+    Heartbeat heartbeat = 4;
+  }
+}
+
+message SyncResponse {
+  oneof payload {
+    ConfigurationSnapshot snapshot = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message Registration {
+  string instance_id = 1;
+  uint32 protocol_version = 2;
+  string applied_revision = 3;
+}
+
+message Acknowledgement {
+  uint64 sequence = 1;
+  string revision = 2;
+}
+
+message Rejection {
+  uint64 sequence = 1;
+  string revision = 2;
+  string reason_code = 3;
+  string message = 4;
+}
+
+message Heartbeat {}
+
+message ConfigurationSnapshot {
+  uint64 sequence = 1;
+  string revision = 2;
+  google.protobuf.Timestamp generated_at = 3;
+  DynamicConfiguration configuration = 4;
+}
+
+message DynamicConfiguration {
+  repeated ApiClient api_clients = 1;
+  repeated Route routes = 2;
+}
+
+message ApiClient {
+  string id = 1;
+  string sha256 = 2;
+  repeated string scopes = 3;
+}
+
+message Route {
+  string id = 1;
+  string path_prefix = 2;
+  string upstream = 3;
+  int64 timeout_nanos = 4;
+  AuthenticationPolicy auth = 5;
+  RateLimitPolicy rate_limit = 6;
+  WafPolicy waf = 7;
+}
+
+message AuthenticationPolicy {
+  string mode = 1;
+  repeated string required_scopes = 2;
+}
+
+message RateLimitPolicy {
+  int64 capacity = 1;
+  double refill_per_second = 2;
+  string on_redis_error = 3;
+}
+
+message WafPolicy {
+  string mode = 1;
+  string rule_set = 2;
+  int32 anomaly_threshold = 3;
+  InspectionPolicy inspection = 4;
+}
+
+message InspectionPolicy {
+  bool query = 1;
+  bool headers = 2;
+  bool body = 3;
+  int32 max_query_bytes = 4;
+  int32 max_header_bytes = 5;
+  int32 max_body_bytes = 6;
+  int32 max_json_depth = 7;
+  int32 max_json_elements = 8;
+}

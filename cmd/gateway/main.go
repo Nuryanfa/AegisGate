@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Nuryanfa/AegisGate/internal/auth"
 	"github.com/Nuryanfa/AegisGate/internal/config"
+	"github.com/Nuryanfa/AegisGate/internal/controlplane"
 	"github.com/Nuryanfa/AegisGate/internal/middleware"
 	"github.com/Nuryanfa/AegisGate/internal/observability"
 	"github.com/Nuryanfa/AegisGate/internal/proxy"
@@ -97,15 +99,64 @@ func main() {
 		logger.Error("build gateway routes", "error", err)
 		os.Exit(1)
 	}
+	var runtimeStore *controlplane.Store
+	var syncClient *controlplane.Client
+	if cfg.ControlPlane != nil {
+		bootstrap := config.Bootstrap(cfg)
+		wire, wireErr := controlplane.ToProto(bootstrap)
+		if wireErr != nil {
+			logger.Error("invalid bootstrap snapshot", "reason", "validation")
+			os.Exit(1)
+		}
+		revision, revErr := controlplane.Revision(wire)
+		if revErr != nil {
+			logger.Error("invalid bootstrap revision", "reason", "validation")
+			os.Exit(1)
+		}
+		compiler := controlplane.Compiler{WriteTimeout: cfg.WriteTimeout, Limiter: limiter, Inspector: waf.NewEngine(), Events: eventPipeline, Metrics: metrics, Tracing: tracing, Logger: logger}
+		runtimeStore = controlplane.NewStore(&controlplane.Runtime{Revision: revision, Handler: proxyHandler, Routes: cfg.Routes}, compiler, cfg.ControlPlane)
+		syncClient, err = controlplane.NewClient(*cfg.ControlPlane, runtimeStore, logger)
+		if err != nil {
+			logger.Error("invalid control-plane client credentials", "reason", "validation")
+			os.Exit(1)
+		}
+		if metrics != nil {
+			cpMetrics := observability.NewControlPlaneMetrics(metrics.Registry())
+			runtimeStore.SetMetrics(cpMetrics)
+			syncClient.SetMetrics(cpMetrics)
+		}
+		syncClient.SetTracing(tracing)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.HealthHandler)
 	readinessChecks := make([]server.ReadinessCheck, 0, 1)
-	if limiter != nil && hasFailClosedRateLimit(cfg.Routes) {
-		readinessChecks = append(readinessChecks, limiter.Ping)
+	if limiter != nil {
+		readinessChecks = append(readinessChecks, func(ctx context.Context) error {
+			routes := cfg.Routes
+			if runtimeStore != nil {
+				routes = runtimeStore.Active().Routes
+			}
+			if hasFailClosedRateLimit(routes) {
+				return limiter.Ping(ctx)
+			}
+			return nil
+		})
+	}
+	if runtimeStore != nil {
+		readinessChecks = append(readinessChecks, func(context.Context) error {
+			if runtimeStore.Ready() {
+				return nil
+			}
+			return errors.New("control-plane configuration unavailable")
+		})
 	}
 	mux.Handle("/readyz", server.ReadinessHandler(readinessChecks...))
-	mux.Handle("/", proxyHandler)
+	if runtimeStore != nil {
+		mux.Handle("/", runtimeStore)
+	} else {
+		mux.Handle("/", proxyHandler)
+	}
 
 	handler := middleware.RequestID(observability.Middleware(tracing, metrics, middleware.LoggingWithObservability(logger, mux, metrics)))
 	httpServer := server.New(server.Options{
@@ -117,6 +168,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var syncDone chan struct{}
+	if syncClient != nil {
+		syncDone = make(chan struct{})
+		go func() { defer close(syncDone); syncClient.Run(ctx) }()
+	}
 	var telemetry *server.Telemetry
 	if metrics != nil {
 		telemetry, err = server.StartTelemetry(cfg.Observability.Metrics, metrics.Handler(cfg.Observability.Metrics.Path), logger)
@@ -134,6 +190,14 @@ func main() {
 		telemetryTimeout = cfg.Observability.Metrics.ShutdownTimeout
 	}
 	runErr := server.RunWithTelemetry(ctx, httpServer, telemetry, cfg.ShutdownTimeout, telemetryTimeout)
+	if syncDone != nil {
+		stop()
+		select {
+		case <-syncDone:
+		case <-time.After(cfg.ControlPlane.ShutdownTimeout):
+			logger.Warn("control-plane client shutdown deadline reached")
+		}
+	}
 	shutdownSecurityEvents(eventPipeline, cfg.SecurityEvents, logger)
 	shutdownTracing(tracing, cfg.Observability, logger)
 	if runErr != nil {

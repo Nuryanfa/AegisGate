@@ -271,3 +271,17 @@ These must be confirmed before repository scaffolding hardens them:
 - 2026-10-02: v0.7 review hardening: remove raw trace headers unconditionally
   before proxying, inject active trace context only when tracing is enabled,
   and pass bounded static build metadata into Docker gateway images.
+- 2026-10-03: Released AegisGate v0.7.0 with Prometheus metrics, OpenTelemetry
+  tracing, a dedicated telemetry listener, trace-safe reverse-proxy
+  propagation, operational dashboards, alert rules, and static build metadata.
+- 2026-10-03: Began v0.8 on `feature/v0.8-grpc-control-plane` after synchronizing
+  `develop` with the v0.7 release commit. Selected one in-memory authority,
+  typed gRPC streams, canonical content revisions, bounded latest-wins fan-out,
+  node-local secrets and dependencies, and immutable atomic gateway runtimes.
+  Development-only insecure Compose transport and production mTLS are explicit;
+  ADR 0006 records the decision.
+- 2026-10-03: Corrected v0.8 freshness to use the last authenticated valid
+  snapshot or heartbeat, independently of the last accepted snapshot time.
+  Enforced a minimum 1m stale deadline for the 30s heartbeat cadence, added
+  explicit gRPC TraceContext transport instrumentation, and finalized the
+  v0.7 release wording in the README. v0.8 remains pending review.

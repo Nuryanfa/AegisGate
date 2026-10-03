@@ -1,4 +1,61 @@
 services:
+  control-plane:
+    profiles: ["control-plane-demo"]
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: control-plane
+    environment:
+      AEGIS_CONTROL_PLANE_CONFIG_PATH: /etc/aegisgate/control-plane.yaml
+    volumes:
+      - ./configs/control-plane.example.yaml:/etc/aegisgate/control-plane.yaml:ro
+      - ./configs/snapshots/example.yaml:/etc/aegisgate/snapshot.yaml:ro
+    expose:
+      - "8443"
+      - "9092"
+    stop_grace_period: 10s
+    init: true
+
+  gateway-cp-a:
+    profiles: ["control-plane-demo"]
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: gateway
+    environment:
+      AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
+      AEGIS_CONTROL_PLANE_INSTANCE_ID: gateway-a
+    volumes:
+      - ./configs/config.control-plane-demo.yaml:/etc/aegisgate/config.yaml:ro
+    ports:
+      - "127.0.0.1:8084:8080"
+    depends_on:
+      - control-plane
+      - users-upstream
+      - orders-upstream
+    stop_grace_period: 20s
+    init: true
+
+  gateway-cp-b:
+    profiles: ["control-plane-demo"]
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile
+      target: gateway
+    environment:
+      AEGIS_CONFIG_PATH: /etc/aegisgate/config.yaml
+      AEGIS_CONTROL_PLANE_INSTANCE_ID: gateway-b
+    volumes:
+      - ./configs/config.control-plane-demo.yaml:/etc/aegisgate/config.yaml:ro
+    ports:
+      - "127.0.0.1:8085:8080"
+    depends_on:
+      - control-plane
+      - users-upstream
+      - orders-upstream
+    stop_grace_period: 20s
+    init: true
+
   gateway:
     build:
       context: .

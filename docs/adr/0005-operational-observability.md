@@ -1,6 +1,6 @@
 # ADR 0005: Operational observability with bounded telemetry
 
-- Status: Accepted for v0.7 feature branch
+- Status: Accepted; released in v0.7.0
 - Date: 2026-10-02
 
 ## Context

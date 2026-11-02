@@ -1,6 +1,6 @@
 # AegisGate v0.8 control plane
 
-This feature branch adds a **single-authority**, in-memory gRPC control plane. It is not a highly available production control plane. The data plane still owns HTTP and telemetry listeners, Redis connectivity and credentials, security-event capacity, tracing exporter settings, and TLS private keys. Only routes, policy values, API-client IDs, SHA-256 digests, and scopes travel in protobuf snapshots. Plaintext API keys never travel over the stream.
+AegisGate v0.8 adds a **single-authority**, in-memory gRPC control plane. It is not a highly available production control plane. The data plane still owns HTTP and telemetry listeners, Redis connectivity and credentials, security-event capacity, tracing exporter settings, and TLS private keys. Only routes, policy values, API-client IDs, SHA-256 digests, and scopes travel in protobuf snapshots. Plaintext API keys never travel over the stream.
 
 ## Protocol and atomic application
 

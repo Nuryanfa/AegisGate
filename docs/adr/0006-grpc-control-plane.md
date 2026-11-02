@@ -1,6 +1,6 @@
 # ADR 0006: Single-authority gRPC configuration distribution
 
-Status: accepted for v0.8 feature branch (2026-10-03)
+Status: accepted (2026-10-03); released in v0.8.0
 
 ## Context
 

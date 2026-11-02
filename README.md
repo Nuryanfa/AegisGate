@@ -79,6 +79,20 @@ valid API key. The committed configuration also demonstrates shared Redis
 quotas, WAF audit/enforce modes, and best-effort security-event logging.
 Only gateway port 8080 is published; Redis is internal to Compose.
 
+### Shared Redis quota demo
+
+```sh
+docker compose --profile distributed-demo up -d --build
+curl -i http://127.0.0.1:8080/api/users/42
+curl -i http://127.0.0.1:8083/api/users/42
+docker compose --profile distributed-demo down
+```
+
+The `distributed-demo` profile adds `gateway-secondary` on port 8083 with the
+same configuration and Redis instance, so rate-limited routes draw from one
+shared token bucket across both gateways. Unlike the other demo ports, 8083
+is bound on all host interfaces; stop the stack when you are done.
+
 ### v0.8 multi-gateway control-plane demo
 
 ```sh
@@ -251,8 +265,9 @@ production throughput:
 ## Security boundaries
 
 An API key is a bearer credential, not end-user identity or resource-level
-authorization. Use TLS, rotate keys, and keep plaintext outside source
-control. Rate limiting is not DDoS protection. The WAF is not OWASP CRS,
+authorization. The gateway listener serves plaintext HTTP; terminate TLS in a
+trusted component in front of it, rotate keys, and keep plaintext keys outside
+source control. Rate limiting is not DDoS protection. The WAF is not OWASP CRS,
 malware scanning, or proof that a request is safe; upstreams still need
 parameterized queries, contextual output encoding, input validation, and
 their own authorization. The event pipeline is not a durable audit log, SIEM,
@@ -265,16 +280,38 @@ See the [API-key trust model](docs/adr/0001-api-client-key-trust-model.md),
 [control-plane decision](docs/adr/0006-grpc-control-plane.md) for precise
 security and failure assumptions.
 
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `cmd/gateway` | Gateway data-plane binary |
+| `cmd/control-plane` | Single-authority gRPC configuration server |
+| `cmd/keygen` | API-key and SHA-256 digest generator |
+| `cmd/example-upstream` | Demo upstream service used by Compose |
+| `internal/` | Router, proxy, auth, rate limit, WAF, security events, observability, control plane |
+| `api/controlplane/v1` | Protobuf schema and committed generated Go code |
+| `configs/` | Example gateway, control-plane, and snapshot configuration |
+| `deployments/` | Dockerfile and observability demo configuration |
+| `docs/` | ADRs, operations guides, benchmarks, and project memory |
+
 ## Roadmap
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| v0.1–v0.3 | Gateway, routing, and API-client authorization | Implemented |
+| v0.1–v0.3 | Gateway, routing, and API-client authorization | Released (`v0.1.0`–`v0.3.0`) |
 | v0.4 | Distributed Redis rate limiting | Released (`v0.4.0`) |
 | v0.5 | Bounded WAF inspection | Released (`v0.5.0`) |
 | v0.6 | Asynchronous security events and process-local detection | Released (`v0.6.0`) |
 | v0.7 | Metrics, tracing, and operational observability | Released (`v0.7.0`) |
 | v0.8 | gRPC control plane and atomic distributed configuration | Released (`v0.8.0`) |
+| Next | Not yet scoped | Planning |
+
+Not implemented yet: JWT/RBAC, an in-process HTTPS listener, upstream health
+checks, load balancing, circuit breaking, retries, a trusted-proxy client-IP
+model, explicit WebSocket support, an admin API or PostgreSQL persistence, a
+dashboard, an external event broker, and Kubernetes/Terraform deployment. The
+[project memory](docs/PROJECT_MEMORY.md) tracks this backlog; each item needs
+its own ADR before it is built.
 
 `main` carries reviewed releases; `develop` is the integration branch.
 Architecture decisions live in [`docs/adr/`](docs/adr/) and the

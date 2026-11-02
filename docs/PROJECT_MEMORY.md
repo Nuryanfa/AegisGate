@@ -1,6 +1,6 @@
 # AegisGate Project Memory
 
-Last updated: 2026-10-02
+Last updated: 2026-11-02
 
 This file is the durable working memory for the repository. It summarizes the
 current understanding of `PRD.md`; it does not silently turn proposals into
@@ -19,11 +19,16 @@ asynchronous security events, resiliency, and telemetry.
 ## Product boundaries
 
 - Primary language: Go.
-- Initial protocols: HTTP/HTTPS and WebSocket; gRPC is later scope.
+- Data-plane protocol: plaintext HTTP. The gateway has no in-process TLS
+  listener yet, so HTTPS must be terminated by a trusted component in front of
+  it. WebSocket proxying is a PRD goal but is not yet an explicitly specified
+  and tested contract. gRPC is used only for the v0.8 control-plane stream;
+  the gateway does not proxy gRPC traffic.
 - AegisGate is an educational engineering showcase, not a replacement for
   Kong, Envoy, NGINX, a full enterprise WAF, SIEM, IDS, or DDoS scrubbing.
 - The data plane should remain stateless where practical. Shared runtime state
-  may use Redis; durable control-plane data may use PostgreSQL.
+  uses Redis. Durable control-plane data may later use PostgreSQL; no
+  PostgreSQL dependency exists as of v0.8.
 - Security-event processing should be asynchronous, but enforcement decisions
   that must block a request necessarily remain in the synchronous request path.
 
@@ -48,10 +53,12 @@ verified increments.
 Sprint 0 established Go 1.25, standard-library HTTP and reverse-proxy
 components, a non-root distroless container, Docker Compose, and GitHub Actions
 CI. Its single environment-configured route was replaced by v0.2, v0.3 added
-API-client access control, and v0.4 adds Redis-backed distributed rate
-limiting. v0.5 adds bounded request inspection and a small WAF rule foundation.
-v0.6 replaces synchronous WAF-event logging with a bounded asynchronous
-pipeline and adds deterministic process-local burst detection.
+API-client access control, and v0.4 added Redis-backed distributed rate
+limiting. v0.5 added bounded request inspection and a small WAF rule foundation.
+v0.6 replaced synchronous WAF-event logging with a bounded asynchronous
+pipeline and deterministic process-local burst detection. v0.7 added
+Prometheus metrics, OpenTelemetry tracing, and operational documentation.
+v0.8 added a single-authority gRPC control plane with atomic runtime swaps.
 
 ## Confirmed v0.2 routing foundation
 
@@ -168,30 +175,106 @@ pipeline and adds deterministic process-local burst detection.
   failure. It is not a SIEM or cross-instance detector. ADR 0004 records this
   architecture and its rejected alternatives.
 
+## Confirmed v0.7 operational-observability foundation
+
+- `observability` is optional; omitted means metrics and tracing are off and
+  v0.6 configuration remains valid. The block is file-only.
+- Native Prometheus metrics use a private registry (project, Go, process
+  collectors) and a read-only collector over the v0.6 pipeline snapshot. They
+  are not duplicated through OpenTelemetry.
+- Metrics are served on a dedicated listener with an exact path and explicit
+  timeouts. Compose does not publish it on the public gateway port. A listener
+  bind or unexpected termination fails the process.
+- Labels are route IDs from validated configuration plus finite enums. No
+  request/trace IDs, URLs, query strings, API identities, client addresses,
+  WAF evidence, arbitrary headers, or raw errors become labels. Latency
+  histograms span 1 ms to 10 s.
+- Tracing uses the OpenTelemetry SDK with parent-based ratio sampling, a
+  bounded batch queue, OTLP HTTP export, and W3C TraceContext only. One server
+  span per request, internal spans for rate-limit and WAF checks, and one
+  upstream client span. Disabled tracing creates no exporter or worker.
+- Client-supplied trace headers are always stripped before proxying. With
+  tracing enabled, only the active `traceparent` is injected; client
+  `tracestate` is discarded and baggage is never forwarded.
+- Exporter failures never change security decisions or readiness; buffered
+  spans may be lost. Shutdown drains gateway HTTP, then telemetry HTTP, then
+  the security-event pipeline, then flushes the trace provider.
+- Static build metadata (`VERSION`, `COMMIT`, `BUILD_TIME`) is supplied as
+  Docker build arguments and exposed via startup logs and
+  `aegisgate_build_info`.
+- The Compose `observability` profile (Prometheus, OTel Collector, Jaeger,
+  Grafana) is a non-durable demo. SLIs/SLOs are illustrative, not measured.
+  ADR 0005 records the decision.
+
+## Confirmed v0.8 gRPC control-plane foundation
+
+- One in-memory writable authority (`cmd/control-plane`) loads a strict YAML
+  snapshot from `AEGIS_CONTROL_PLANE_CONFIG_PATH`, refuses startup without a
+  valid initial snapshot, and reloads only on `SIGHUP`. There is no file
+  polling, persistent history, consensus, HA, admin API, or rollback.
+- `api/controlplane/v1/configuration.proto` defines the bidirectional
+  `ConfigurationService.Sync` stream. Generated Go code is committed, produced
+  by Buf, and never hand-edited; CI checks generation and breaking changes
+  against `origin/main`.
+- Snapshots carry only routes, policy values, API-client IDs, SHA-256 digests,
+  and scopes. Listeners, Redis credentials, TLS keys, telemetry settings, and
+  security-event capacity remain node-local and restart-only.
+- Revisions are canonical SHA-256 content hashes (sorted routes, clients, and
+  scopes; deterministic marshaling). Stream sequence restarts at 1 per stream
+  and is independent of content identity.
+- Gateways validate, check local capabilities, compile a complete immutable
+  runtime, publish it with one `atomic.Pointer` store, and then ACK. An
+  unchanged revision is ACKed without recompilation. Failures keep the prior
+  runtime and send a sanitized NACK (`validation`, `dependency`, `protocol`).
+- Requests load the runtime pointer once; in-flight requests finish on the
+  runtime they selected. No global mutex sits in request dispatch.
+- The authority bounds connections and streams with `max_clients` and keeps
+  one latest-wins pending slot per stream. Gateways run one reconnect
+  supervisor with exponential backoff and up to 25% jitter.
+- `control_plane` absent preserves v0.7 behavior. `require_remote` returns
+  `503 CONFIG_NOT_READY` until a remote revision is accepted;
+  `use_bootstrap` serves local routes immediately.
+- Heartbeats arrive every 30s; `stale_after` is at least 1m. Freshness uses
+  the last valid snapshot or heartbeat, not the last configuration change.
+  `stale_policy: deny` returns `503 CONFIG_STALE` and fails readiness;
+  `serve` keeps the last-known-good runtime.
+- Production requires mTLS on both sides (TLS 1.2+); plaintext gRPC is allowed
+  only in explicit development mode, as in the Compose demo.
+- Route metric series admit at most 64 distinct route IDs per process; later
+  IDs map to `_other`. ADR 0006 and `docs/control-plane.md` record the
+  protocol and failure contracts.
+
 ## Critical engineering observations
 
 - “10,000+ requests/second” and latency targets are hypotheses until the test
   environment and scenario are defined. They must not be presented as achieved
-  results without reproducible evidence.
+  results without reproducible evidence. *Still open: only narrow
+  microbenchmarks exist (v0.5–v0.8); no end-to-end load test has been run.*
 - A regex-only WAF is useful as an educational component but is bypass-prone
   and can cause false positives or regex denial of service. Rules need bounded
   input, normalization policy, safe regexes, audit mode, and bypass tests.
+  *Addressed for `core-v1` in v0.5 (ADR 0003).*
 - Distributed token-bucket behavior in Redis needs atomic operations, normally
   via Lua or an equivalent atomic primitive, plus a declared fail-open/fail-
-  closed policy for Redis outages.
+  closed policy for Redis outages. *Addressed in v0.4 (ADR 0002).*
 - Client-IP rate limiting is unsafe until trusted proxies and `Forwarded` /
-  `X-Forwarded-For` handling are specified.
+  `X-Forwarded-For` handling are specified. *Still open: public quotas use
+  the direct socket peer only.*
 - An in-memory Go channel is not durable. Queue saturation, drop/backpressure
   policy, shutdown draining, and event-loss metrics must be explicit.
+  *Addressed in v0.6/v0.7 (ADR 0004, ADR 0005); events remain non-durable.*
 - Authentication requires issuer, audience, algorithm allowlist, key rotation,
   clock skew, and JWKS/static-key decisions; “validate JWT” alone is
-  insufficient.
+  insufficient. *Still open: JWT is not implemented.*
 - Route configuration needs deterministic precedence, path rewrite semantics,
-  config validation, and an atomic reload strategy.
+  config validation, and an atomic reload strategy. *Addressed in v0.2
+  (precedence, validation) and v0.8 (atomic remote reload).*
 - Retries can duplicate side effects. The default should be no retry unless the
-  method and failure mode are proven safe.
+  method and failure mode are proven safe. *Current behavior: no retries.*
 - Control plane and data plane separation should be conceptual first; splitting
   them into deployable services too early would add complexity before value.
+  *v0.8 split them deliberately while keeping the control plane off the
+  request path.*
 - PostgreSQL should not sit in the gateway request path for ordinary routing or
   authentication decisions.
 
@@ -209,22 +292,48 @@ pipeline and adds deterministic process-local burst detection.
 
 ## Open decisions
 
-These must be confirmed before repository scaffolding hardens them:
+- License and intended reuse policy. Until chosen, all rights are reserved.
+- Scope of the next milestone after v0.8 (see the PRD backlog below).
+- JWT trust model: issuer, audience, algorithm allowlist, key source
+  (static vs. JWKS), rotation, and clock skew.
+- Trusted-proxy model for deriving client IPs from `Forwarded` /
+  `X-Forwarded-For`.
+- Whether WebSocket proxying becomes an explicit, tested contract, and how it
+  interacts with WAF body inspection and route deadlines.
 
-- GitHub owner/organization, repository name, and public/private visibility.
-- Go module path (normally tied to the GitHub repository URL).
-- License and intended reuse policy.
-- Whether the recommended first vertical slice is the agreed MVP.
-- Supported development baseline: Go version and whether Docker Desktop/WSL2
-  is available on the primary machine.
-- Initial configuration contract: YAML-only with restart, or hot reload.
-- JWT trust model and Redis outage policy for later phases.
+Resolved since the original list:
+
+- Repository and module path: `github.com/Nuryanfa/AegisGate`.
+- Development baseline: Go 1.25.x with Docker Compose demos.
+- First vertical slice: delivered as Sprint 0/v0.1.
+- Configuration contract: strict YAML with restart (v0.2), plus validated
+  remote snapshots with atomic swap when `control_plane` is set (v0.8).
+- Redis outage policy: explicit per-route `deny` or `allow` (v0.4).
+
+## PRD backlog not yet implemented
+
+These PRD items have no accepted design yet. Each needs its own scoped
+milestone and ADR before implementation:
+
+- JWT authentication and role-based authorization.
+- In-process HTTPS listener with certificate management for the data plane.
+- Upstream health checks, load balancing across replicas, circuit breaking,
+  and idempotency-aware retries.
+- Trusted-proxy client-IP model and invalid-key abuse limiting.
+- Explicit WebSocket support.
+- Admin API, PostgreSQL persistence, and durable configuration history.
+- Real-time dashboard and WebSocket event streaming.
+- External event broker (NATS/Kafka) and cross-instance detection.
+- Kubernetes manifests and Terraform.
+- End-to-end load testing, profiling, and chaos testing.
 
 ## Confirmed facts
 
 - Working project name: AegisGate.
-- Existing product document: `PRD.md`, version 1.0, status Planning.
-- Git is installed locally.
+- Existing product document: `PRD.md`, version 1.0, status Planning. It is a
+  vision document; this file and accepted ADRs record what is actually built.
+- Git remote: `github.com/Nuryanfa/AegisGate`. Release tags `v0.1.0` through
+  `v0.8.0` exist on the remote.
 - The directory was not a Git repository when first inspected on 2026-09-27.
 
 ## Branching strategy
@@ -236,6 +345,9 @@ These must be confirmed before repository scaffolding hardens them:
   through pull requests.
 - A completed milestone is promoted from `develop` to `main` after tests,
   documentation, container validation, and review are complete.
+- As of 2026-11-02, `develop` is two commits ahead of `main` and `v0.8.0`:
+  the v0.8 README refresh and the CI Buf breaking-check fix. Both are
+  documentation/CI-only and unreleased.
 
 ## Decision log
 
@@ -288,3 +400,9 @@ These must be confirmed before repository scaffolding hardens them:
 - 2026-10-03: Released AegisGate v0.8.0 on `main` with the single-authority
   gRPC control plane, atomic gateway runtime publication, mTLS contract,
   freshness-aware heartbeat handling, and transport-level trace propagation.
+- 2026-10-03: On `develop`, refreshed the README as a v0.8 portfolio showcase
+  and changed CI to run `buf breaking` against the remote `main` branch.
+- 2026-11-02: Refreshed this memory: added confirmed v0.7 and v0.8 sections,
+  annotated which critical observations are addressed, resolved obsolete open
+  decisions, and recorded the unimplemented PRD backlog. No new scope was
+  accepted.

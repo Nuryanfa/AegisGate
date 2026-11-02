@@ -345,9 +345,9 @@ milestone and ADR before implementation:
   through pull requests.
 - A completed milestone is promoted from `develop` to `main` after tests,
   documentation, container validation, and review are complete.
-- As of 2026-11-02, `develop` is two commits ahead of `main` and `v0.8.0`:
-  the v0.8 README refresh and the CI Buf breaking-check fix. Both are
-  documentation/CI-only and unreleased.
+- As of 2026-11-02, `main` and `develop` are synchronized. `main` is ahead of
+  the `v0.8.0` tag only by documentation and CI changes (README/memory
+  refresh and the Buf breaking-check fix); no unreleased code exists.
 
 ## Decision log
 
